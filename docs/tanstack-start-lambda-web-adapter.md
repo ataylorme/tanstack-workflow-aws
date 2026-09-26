@@ -59,7 +59,7 @@ Await the runtime call before returning the HTTP response. Do not detach it with
 
 ## Deploy the dedicated sweeper
 
-1. Deploy [`global-table.yaml`](../cloudformation/global-table.yaml) once from `us-west-2`. It creates the east/west replicas and an Ohio witness. This is a fresh-table example; changing an existing MRSC witness/replica topology is not an in-place migration procedure. Wait until the table and replicas are ACTIVE.
+1. Deploy [`global-table.yaml`](../cloudformation/global-table.yaml) once from `us-west-2`. It creates the east/west replicas and an Ohio witness. This is a fresh-table example; changing an existing MRSC witness/replica topology is not an in-place migration procedure. Wait until the table and replicas are ACTIVE. See [MRSC provisioning](mrsc-deployment.md) for the explicit CloudFormation service-role option and safe handling of a retained table after partial creation.
 2. Bundle the shared workflows into the sweeper. From this repository:
 
    ```sh

@@ -85,6 +85,8 @@ Deploy the three templates in this order. This example deploys real, billable re
    aws cloudformation deploy --region us-west-2 --stack-name workflow-table --template-file cloudformation/global-table.yaml
    ```
 
+   For an explicit CloudFormation execution role (including temporary-credential deployment troubleshooting), see [MRSC provisioning and safe rollback recovery](docs/mrsc-deployment.md). Do not delete an existing application table to retry provisioning.
+
 3. Deploy `cloudformation/regional.yaml` in **each** application Region with its local S3 bucket and `CodeKey=workflow-handler.zip`. Pass `--capabilities CAPABILITY_IAM`. Read the `ApiDomain` output of both stacks.
 
 4. Deploy `cloudformation/edge.yaml` **only in `us-east-1`** with `WestApiDomain` and `EastApiDomain` from step 3 and `--capabilities CAPABILITY_IAM`. CloudFront uses a versioned Lambda@Edge function at the origin-request event. The edge function hashes `x-workflow-run-id` (or URL path) to distribute requests across the two APIs. The two regional EventBridge rules independently invoke their local sweep Lambda every minute.
