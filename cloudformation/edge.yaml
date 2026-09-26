@@ -3,6 +3,11 @@ Description: Global CloudFront ingress with Lambda@Edge deterministic regional r
 Parameters:
   WestApiDomain: { Type: String, Description: ApiDomain output of us-west-2 stack }
   EastApiDomain: { Type: String, Description: ApiDomain output of us-east-1 stack }
+  RouterRevision:
+    Type: String
+    Default: v1
+    MaxLength: 32
+    Description: Change this value whenever router code changes to publish a new edge version.
 Resources:
   EdgeRole:
     Type: AWS::IAM::Role
@@ -38,7 +43,12 @@ Resources:
           };
   RouterVersion:
     Type: AWS::Lambda::Version
-    Properties: { FunctionName: !Ref Router }
+    # Replicated edge versions cannot be deleted until CloudFront releases them.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref Router
+      Description: !Sub '${RouterRevision}:${WestApiDomain}:${EastApiDomain}'
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:

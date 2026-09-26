@@ -1,5 +1,5 @@
-import { createWorkflow } from '@tanstack/workflow-core'
-import { defineWorkflowRuntime } from '@tanstack/workflow-runtime'
+import { createWorkflow } from '../src/workflow.js'
+import { defineWorkflowRuntime } from '../src/runtime.js'
 import { createDynamoWorkflowExecutionStore } from '../src/index.js'
 
 export const store = createDynamoWorkflowExecutionStore({ tableName: process.env.TABLE_NAME! })

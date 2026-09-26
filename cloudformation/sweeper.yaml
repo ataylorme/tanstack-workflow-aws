@@ -4,6 +4,12 @@ Parameters:
   TableName: { Type: String, Default: tanstack-workflow-aws }
   CodeBucket: { Type: String, Description: S3 bucket containing the bundled Lambda ZIP in this Region }
   CodeKey: { Type: String, Description: S3 key for examples/sweeper bundle }
+  CodeObjectVersion:
+    Type: String
+    Default: ''
+    Description: Optional S3 object version; otherwise use a new CodeKey for every deployment.
+Conditions:
+  HasCodeObjectVersion: !Not [!Equals [!Ref CodeObjectVersion, '']]
 Resources:
   LambdaRole:
     Type: AWS::IAM::Role
@@ -34,7 +40,10 @@ Resources:
       Role: !GetAtt LambdaRole.Arn
       Timeout: 60
       MemorySize: 512
-      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey }
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !If [HasCodeObjectVersion, !Ref CodeObjectVersion, !Ref AWS::NoValue]
       Environment:
         Variables: { TABLE_NAME: !Ref TableName }
   SweepRule:

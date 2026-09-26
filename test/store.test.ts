@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { GetCommand, PutCommand, UpdateCommand, QueryCommand, DeleteCommand, ScanCommand } from '@aws-sdk/lib-dynamodb'
-import { LogConflictError } from '@tanstack/workflow-core'
+import { LogConflictError } from '../src/workflow.js'
 import { createDynamoWorkflowExecutionStore } from '../src/index.js'
 
 function fakeClient() {
@@ -57,11 +57,12 @@ describe('distributed execution store', () => {
 
   it('claims due work once across regions, recovers stale runs, and deduplicates a signal', async () => {
     const { a, b } = stores()
-    await a.saveRunState({ state: { runId: 'r', workflowId: 'w', status: 'paused', input: {}, waitingFor: { signalName: 'done' }, createdAt: 0, updatedAt: 0 } })
+    await a.createRun({ runId: 'r', workflowId: 'w', input: {}, now: 0 })
     await a.scheduleTimer({ runId: 'r', workflowId: 'w', wakeAt: 100, signalId: 's', now: 0 })
     expect(await a.claimDueTimers({ now: 99, limit: 1, leaseOwner: 'west', leaseMs: 50 })).toHaveLength(0)
     expect(await a.claimDueTimers({ now: 100, limit: 1, leaseOwner: 'west', leaseMs: 50 })).toHaveLength(1)
     expect(await b.claimDueTimers({ now: 101, limit: 1, leaseOwner: 'east', leaseMs: 50 })).toHaveLength(0)
+    await a.saveRunState({ state: { runId: 'r', workflowId: 'w', status: 'paused', input: {}, waitingFor: { signalName: 'done' }, createdAt: 0, updatedAt: 0 } })
     expect((await a.deliverSignal({ runId: 'r', delivery: { signalId: 's', name: 'done', payload: true }, now: 101 })).kind).toBe('delivered')
     expect((await b.deliverSignal({ runId: 'r', delivery: { signalId: 's', name: 'done', payload: true }, now: 102 })).kind).toBe('duplicate')
     await a.claimRun({ runId: 'r', leaseOwner: 'west', leaseMs: 50, now: 102 })
@@ -78,7 +79,7 @@ describe('schedule coordination', () => {
     const first = await a.claimDueScheduleBuckets({ now: 100, limit: 1, leaseOwner: 'west', leaseMs: 30 })
     expect(first[0]).toMatchObject({ bucketId: '100', runId: 'w:hourly:100' })
     expect(await b.claimDueScheduleBuckets({ now: 101, limit: 1, leaseOwner: 'east', leaseMs: 30 })).toHaveLength(0)
-    await a.markScheduleBucketStarted({ scheduleId: 'hourly', bucketId: '100', runId: 'w:hourly:100', now: 101 })
+    await a.withLeaseOwner('west', () => a.markScheduleBucketStarted({ scheduleId: 'hourly', bucketId: '100', runId: 'w:hourly:100', now: 101 }))
     expect(await b.claimDueScheduleBuckets({ now: 131, limit: 1, leaseOwner: 'east', leaseMs: 30 })).toHaveLength(0)
   })
 })
@@ -86,8 +87,8 @@ describe('schedule coordination', () => {
 describe('TanStack runtime integration', () => {
   it('starts in one region and resumes from a signal in the other', async () => {
     const { a, b } = stores()
-    const { createWorkflow } = await import('@tanstack/workflow-core')
-    const { defineWorkflowRuntime } = await import('@tanstack/workflow-runtime')
+    const { createWorkflow } = await import('../src/workflow.js')
+    const { defineWorkflowRuntime } = await import('../src/runtime.js')
     const workflow = createWorkflow({ id: 'cross-region' }).handler(async ctx => {
       const result = await ctx.waitForEvent<{ ok: boolean }>('continue')
       return { ok: result.ok }

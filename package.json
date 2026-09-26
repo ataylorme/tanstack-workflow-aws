@@ -8,23 +8,38 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./workflow": {
+      "types": "./dist/workflow.d.ts",
+      "import": "./dist/workflow.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
     }
   },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs",
+    "cloudformation",
+    "examples",
+    "src"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepare": "npm run build",
+    "test:package": "node scripts/delivery-package.mjs",
+    "test:integration": "node scripts/test-integration.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.900.0",
     "@aws-sdk/lib-dynamodb": "^3.900.0",
-    "@tanstack/workflow-core": "^0.0.3",
-    "@tanstack/workflow-runtime": "^0.0.3"
+    "@standard-schema/spec": "^1.1.0",
+    "@opentelemetry/api": "^1.9.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -34,5 +49,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ataylorme/tanstack-workflow-aws.git"
   }
 }
