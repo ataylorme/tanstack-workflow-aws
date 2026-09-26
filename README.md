@@ -6,6 +6,41 @@ The package implements the included TanStack Workflow snapshot’s store interfa
 
 > **Status:** experimental, prepared for controlled AWS integration testing. Regression tests exercise real DynamoDB expressions against DynamoDB Local, upstream store contracts, interrupted runtime recovery, and the installed package. Live MRSC replication, regional failure injection and load testing remain required before production use. See [review evidence and the AWS test plan](docs/testing.md). No AWS deployment has been performed during this review.
 
+## Architecture
+
+The standalone example runs request handlers and background sweepers in both application Regions. Each Lambda uses the packaged workflow runtime and DynamoDB store against its local replica of one MRSC Global Table.
+
+```mermaid
+flowchart TB
+    client["Client"] --> edge["CloudFront + Lambda@Edge<br/>Deterministic regional routing"]
+
+    subgraph west["us-west-2"]
+        westApi["API Gateway HTTP API"] --> westWorker["Request Lambda<br/>Workflow runtime + store"]
+        westEvents["EventBridge<br/>Every minute"] --> westSweep["Sweep Lambda<br/>Workflow runtime + store"]
+        westWorker --> westTable[("DynamoDB replica<br/>Run state, events, timers, schedules<br/>DueIndex")]
+        westSweep --> westTable
+    end
+
+    subgraph east["us-east-1"]
+        eastApi["API Gateway HTTP API"] --> eastWorker["Request Lambda<br/>Workflow runtime + store"]
+        eastEvents["EventBridge<br/>Every minute"] --> eastSweep["Sweep Lambda<br/>Workflow runtime + store"]
+        eastWorker --> eastTable[("DynamoDB replica<br/>Run state, events, timers, schedules<br/>DueIndex")]
+        eastSweep --> eastTable
+    end
+
+    subgraph ohio["us-east-2"]
+        witness["DynamoDB MRSC witness<br/>Quorum participant"]
+    end
+
+    edge --> westApi
+    edge --> eastApi
+    westTable <-->|MRSC replication| eastTable
+    westTable -.-> witness
+    eastTable -.-> witness
+```
+
+Solid arrows show request, invocation and store access paths; dotted links show witness participation in the MRSC quorum, not application access. Both Regions independently sweep due work, with conditional writes and leases coordinating ownership. Lambda@Edge provides placement, **not automatic POST failover**. The Global Table is provisioned by one CloudFormation stack, not one per replica. See [the standalone deployment](#standalone-aws-example) and [the existing-app integration guide](docs/tanstack-start-lambda-web-adapter.md).
+
 ## Install and use
 
 ```sh
