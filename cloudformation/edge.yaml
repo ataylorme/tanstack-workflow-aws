@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Global CloudFront ingress with Lambda@Edge deterministic regional routing. Deploy only in us-east-1.
+Parameters:
+  WestApiDomain: { Type: String, Description: ApiDomain output of us-west-2 stack }
+  EastApiDomain: { Type: String, Description: ApiDomain output of us-east-2 stack }
+Resources:
+  EdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [lambda.amazonaws.com, edgelambda.amazonaws.com] }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  Router:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt EdgeRole.Arn
+      Code:
+        ZipFile: !Sub |
+          exports.handler = async (event) => {
+            const req = event.Records[0].cf.request;
+            const key = req.headers['x-workflow-run-id']?.[0]?.value || req.uri;
+            let hash = 0;
+            for (let i = 0; i < key.length; i++) hash = ((hash * 31) + key.charCodeAt(i)) >>> 0;
+            const west = '${WestApiDomain}';
+            const east = '${EastApiDomain}';
+            const domain = hash % 2 ? east : west;
+            req.origin = { custom: { domainName: domain, port: 443, protocol: 'https', path: '',
+              sslProtocols: ['TLSv1.2'], readTimeout: 30, keepaliveTimeout: 5, customHeaders: {} } };
+            req.headers.host = [{ key: 'Host', value: domain }];
+            return req;
+          };
+  RouterVersion:
+    Type: AWS::Lambda::Version
+    Properties: { FunctionName: !Ref Router }
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+          - Id: west
+            DomainName: !Ref WestApiDomain
+            CustomOriginConfig: { OriginProtocolPolicy: https-only }
+        DefaultCacheBehavior:
+          TargetOriginId: west
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 413f5900-4e21-4f44-ae88-1fb30c7043ca
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref RouterVersion
+Outputs:
+  Endpoint:
+    Value: !Sub https://${Distribution.DomainName}
