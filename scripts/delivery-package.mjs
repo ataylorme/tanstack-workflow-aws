@@ -17,9 +17,9 @@ try {
     cwd: temporary, stdio: 'inherit',
   })
   writeFileSync(join(temporary, 'consumer.mjs'), `
-import { createDynamoWorkflowExecutionStore } from 'tanstack-workflow-aws'
-const { createWorkflow } = await import('tanstack-workflow-aws/workflow')
-const { defineWorkflowRuntime } = await import('tanstack-workflow-aws/runtime')
+import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
+const { createWorkflow } = await import('@ataylorme/tanstack-workflow-aws/workflow')
+const { defineWorkflowRuntime } = await import('@ataylorme/tanstack-workflow-aws/runtime')
 if (typeof createWorkflow !== 'function' || typeof defineWorkflowRuntime !== 'function') throw new Error('Missing pinned runtime exports')
 const store = createDynamoWorkflowExecutionStore({ tableName: 'consumer-smoke' })
 if (typeof store.withLeaseOwner !== 'function' || typeof store.appendEvents !== 'function') {
@@ -29,8 +29,8 @@ console.log('Packed package import and store construction passed')
 `)
   execFileSync(process.execPath, ['consumer.mjs'], { cwd: temporary, stdio: 'inherit' })
   writeFileSync(join(temporary, 'consumer.mts'), `
-import { createDynamoWorkflowExecutionStore } from 'tanstack-workflow-aws'
-import type { WorkflowExecutionStore } from 'tanstack-workflow-aws/runtime'
+import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
+import type { WorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws/runtime'
 const store: WorkflowExecutionStore = createDynamoWorkflowExecutionStore({ tableName: 'consumer-smoke' })
 void store
 `)

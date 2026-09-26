@@ -9,15 +9,15 @@ The package implements the included TanStack Workflow snapshot’s store interfa
 ## Install and use
 
 ```sh
-npm install tanstack-workflow-aws
+npm install @ataylorme/tanstack-workflow-aws
 ```
 
-The package is prepared for publication; the example above will resolve after it is published. Until then, use `npm install` from a checkout or a Git reference. The caller needs a table with string `PK`/`SK` keys and `DueIndex` on string `duePK` and number `dueSK` (see `cloudformation/global-table.yaml`).
+Configure GitHub Packages authentication as described in [the installation guide](docs/packaging.md#github-packages-releases-and-ci). The package is prepared for publication; the example above will resolve after it is published. Until then, use `npm install` from a checkout or a Git reference. The caller needs a table with string `PK`/`SK` keys and `DueIndex` on string `duePK` and number `dueSK` (see `cloudformation/global-table.yaml`).
 
 ```ts
 import { randomUUID } from 'node:crypto'
-import { createDynamoWorkflowExecutionStore } from 'tanstack-workflow-aws'
-import { defineWorkflowRuntime } from 'tanstack-workflow-aws/runtime'
+import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
+import { defineWorkflowRuntime } from '@ataylorme/tanstack-workflow-aws/runtime'
 
 const store = createDynamoWorkflowExecutionStore({ tableName: process.env.TABLE_NAME! })
 const runtime = defineWorkflowRuntime({ store, workflows: {

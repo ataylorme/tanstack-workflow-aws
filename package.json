@@ -1,5 +1,5 @@
 {
-  "name": "tanstack-workflow-aws",
+  "name": "@ataylorme/tanstack-workflow-aws",
   "version": "0.1.0",
   "type": "module",
   "description": "Experimental AWS DynamoDB execution store for TanStack Workflow",
@@ -53,5 +53,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ataylorme/tanstack-workflow-aws.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   }
 }

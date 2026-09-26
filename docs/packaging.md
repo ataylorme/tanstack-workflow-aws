@@ -37,9 +37,9 @@ recovery absent from the published core/runtime packages at review time.
 Use the supported matching engine exports:
 
 ```ts
-import { createWorkflow } from 'tanstack-workflow-aws/workflow'
-import { defineWorkflowRuntime } from 'tanstack-workflow-aws/runtime'
-import { createDynamoWorkflowExecutionStore } from 'tanstack-workflow-aws'
+import { createWorkflow } from '@ataylorme/tanstack-workflow-aws/workflow'
+import { defineWorkflowRuntime } from '@ataylorme/tanstack-workflow-aws/runtime'
+import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
 ```
 
 Do not combine this store with separately installed `@tanstack/workflow-core` or
@@ -48,3 +48,18 @@ is the included snapshot; similarly named npm releases may lack its recovery
 behavior. This approach does not patch or replace dependencies in the consuming
 application. Upgrade the snapshot and rerun recovery tests together when adopting
 future upstream changes.
+
+## GitHub Packages releases and CI
+
+The npm package name is `@ataylorme/tanstack-workflow-aws`. Configure the scope in your consuming project's `.npmrc`:
+
+```ini
+@ataylorme:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+```
+
+Set `NODE_AUTH_TOKEN` locally to a GitHub personal access token (classic) with `read:packages`; never commit the token. Then install with `npm install @ataylorme/tanstack-workflow-aws`. GitHub Actions consumers can use their `GITHUB_TOKEN` when granted access to the package. Package visibility and consumer access are managed in GitHub Packages settings.
+
+To release, update `version` in both package manifests, merge the change, and publish a GitHub release tagged `v<VERSION>` (for example `v0.1.0`) at that commit. The release workflow verifies the tag matches the manifest and runs the reusable test workflow before publishing using its built-in `GITHUB_TOKEN` with `packages: write`. No separate publishing secret is required. Prereleases use the `next` npm dist-tag; regular releases use `latest`. Each version can be published only once. This change configures publishing but does not create a release.
+
+PRs and pushes to `main` run typecheck, build, all tests against DynamoDB Local, an installed-package smoke test and Lambda bundle checks on Node 20, 22 and 24. The Node 22 job also lints CloudFormation. Tests use read-only repository permissions and no AWS credentials. The same workflow runs on the release commit before publication. Repository administrators can require the three `Test Node` checks through branch protection.

@@ -1,0 +1,50 @@
+name: Publish GitHub package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+  publish:
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@ataylorme'
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; const p = JSON.parse(fs.readFileSync("package.json", "utf8")); if (process.env.RELEASE_TAG !== `v${p.version}`) throw new Error("Release tag must equal v" + p.version); if (p.name !== "@ataylorme/tanstack-workflow-aws") throw new Error("Unexpected package name")'
+      - run: npm ci
+      - run: npm run build
+      - name: Publish release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = true ]; then
+            npm publish --tag next
+          else
+            npm publish --tag latest
+          fi
