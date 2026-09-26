@@ -2,7 +2,7 @@
 
 An experimental `WorkflowExecutionStore` package for **TanStack Workflow** on AWS. It provides a DynamoDB execution store and a runnable, two-Region Lambda/EventBridge/CloudFront example. It does not use Vercel Workflow.
 
-The package implements the current `@tanstack/workflow-runtime` 0.0.3 store interface. Both `us-west-2` and `us-east-2` may accept requests, execute workflows and sweep due work independently. They use their local replica of one **MRSC** DynamoDB Global Table; a witness in `us-east-1` forms the third quorum member. The same run can resume in either application Region.
+The package implements the current `@tanstack/workflow-runtime` 0.0.3 store interface. Both `us-west-2` and `us-east-1` may accept requests, execute workflows and sweep due work independently. They use their local replica of one **MRSC** DynamoDB Global Table; a witness in `us-east-2` forms the third quorum member. The same run can resume in either application Region.
 
 > **Status:** prototype. Unit and runtime integration tests use a deterministic simulated document client. The CloudFormation templates pass `cfn-lint`; live cross-Region MRSC failure injection, load testing, security hardening and the full upstream store contract suite remain required before production deployment. No AWS resources are created by this repository.
 
@@ -51,7 +51,17 @@ This relies on **MRSC** conditional writes and strongly consistent reads. Ordina
 
 A GSI is eventually consistent even on an MRSC table. A new timer or newly expired lease may be discovered on a later sweep. Duplicate EventBridge invocations and candidate reads are harmless to claims, but **external side effects still require idempotency keys** because a worker can die after a side effect and before its completion event commits. Keep clock skew below the lease margin; use a lease longer than the maximum expected store write and heartbeat interval. A lost MRSC quorum prevents writes; no store can continue safely in a single isolated Region under this consistency model.
 
-## AWS example
+## Framework-independent package
+
+The library implements TanStack Workflow's store contract for a Node.js runtime. It has no dependency on TanStack Start, Lambda Web Adapter, an application's database, or an HTTP routing framework. Applications supply their workflow definitions and may use any business datastore. The Lambda handlers and CloudFormation templates are optional deployment examples; separate regional sweep Lambdas can share any application's workflow registry.
+
+## TanStack Start with Lambda Web Adapter and Aurora DSQL
+
+For an existing Start application in `us-east-1` and `us-west-2`, use this package in server functions/routes alongside your DSQL client. DSQL remains the application database; DynamoDB MRSC holds workflow coordination and history. The recommended deployment adds a dedicated EventBridge sweep Lambda in each application Region, sharing the same workflow definitions as the web application. Reuse the application's existing CloudFront/Lambda@Edge ingress.
+
+See [the integration guide](docs/tanstack-start-lambda-web-adapter.md) for request ownership, bounded execution, the DSQL outbox boundary, and the dedicated [sweeper template](cloudformation/sweeper.yaml). These integration files do not provision or modify DSQL clusters or your Start application.
+
+## Standalone AWS example
 
 Deploy the three templates in this order. This example deploys real, billable resources; inspect and adapt its public API, IAM, retention and monitoring settings before running it. CloudFormation controls the Global Table **from one stack in one Region**.
 
@@ -64,10 +74,10 @@ Deploy the three templates in this order. This example deploys real, billable re
    npx esbuild examples/handler.ts --bundle --platform=node --target=node22 --format=cjs --outfile=build/lambda/handler.js
    (cd build/lambda && zip ../workflow-handler.zip handler.js)
    aws s3 cp build/workflow-handler.zip s3://YOUR-WEST-BUCKET/workflow-handler.zip --region us-west-2
-   aws s3 cp build/workflow-handler.zip s3://YOUR-EAST-BUCKET/workflow-handler.zip --region us-east-2
+   aws s3 cp build/workflow-handler.zip s3://YOUR-EAST-BUCKET/workflow-handler.zip --region us-east-1
    ```
 
-2. Deploy `cloudformation/global-table.yaml` **once**, from `us-west-2`. Wait until both replicas are ACTIVE. It creates replicas in `us-west-2` and `us-east-2` and a witness in `us-east-1`. Do not deploy the same table template again in Ohio.
+2. Deploy `cloudformation/global-table.yaml` **once**, from `us-west-2`. Wait until both replicas are ACTIVE. It creates replicas in `us-west-2` and `us-east-1` and a witness in `us-east-2`. Do not deploy the same table template again in N. Virginia.
 
    ```sh
    aws cloudformation deploy --region us-west-2 --stack-name workflow-table --template-file cloudformation/global-table.yaml

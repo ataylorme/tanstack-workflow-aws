@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Global CloudFront ingress with Lambda@Edge deterministic regional routing. Deploy only in us-east-1.
 Parameters:
   WestApiDomain: { Type: String, Description: ApiDomain output of us-west-2 stack }
-  EastApiDomain: { Type: String, Description: ApiDomain output of us-east-2 stack }
+  EastApiDomain: { Type: String, Description: ApiDomain output of us-east-1 stack }
 Resources:
   EdgeRole:
     Type: AWS::IAM::Role

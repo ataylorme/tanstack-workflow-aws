@@ -29,9 +29,9 @@ Resources:
           Projection: { ProjectionType: KEYS_ONLY }
       Replicas:
         - Region: us-west-2
-        - Region: us-east-2
-      GlobalTableWitnesses:
         - Region: us-east-1
+      GlobalTableWitnesses:
+        - Region: us-east-2
 Outputs:
   TableName:
     Value: !Ref WorkflowTable
