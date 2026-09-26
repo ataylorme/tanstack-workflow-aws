@@ -1,0 +1,37 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MRSC coordination table for active/active TanStack Workflow (deploy this stack once only).
+Parameters:
+  TableName:
+    Type: String
+    Default: tanstack-workflow-aws
+Resources:
+  WorkflowTable:
+    Type: AWS::DynamoDB::GlobalTable
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      MultiRegionConsistency: STRONG
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: duePK, AttributeType: S }
+        - { AttributeName: dueSK, AttributeType: N }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: DueIndex
+          KeySchema:
+            - { AttributeName: duePK, KeyType: HASH }
+            - { AttributeName: dueSK, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
+      Replicas:
+        - Region: us-west-2
+        - Region: us-east-1
+      GlobalTableWitnesses:
+        - Region: us-east-2
+Outputs:
+  TableName:
+    Value: !Ref WorkflowTable

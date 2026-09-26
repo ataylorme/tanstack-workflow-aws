@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.env
+build/
+dynamodb-local-metadata.json

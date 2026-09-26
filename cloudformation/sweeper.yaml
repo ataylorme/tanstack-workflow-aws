@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Dedicated workflow sweeper for an existing app. Deploy in us-east-1 and us-west-2.
+Parameters:
+  TableName: { Type: String, Default: tanstack-workflow-aws }
+  CodeBucket: { Type: String, Description: S3 bucket containing the bundled Lambda ZIP in this Region }
+  CodeKey: { Type: String, Description: S3 key for examples/sweeper bundle }
+  CodeObjectVersion:
+    Type: String
+    Default: ''
+    Description: Optional S3 object version; otherwise use a new CodeKey for every deployment.
+Conditions:
+  HasCodeObjectVersion: !Not [!Equals [!Ref CodeObjectVersion, '']]
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkflowStore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/DueIndex
+  Worker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: sweeper.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !If [HasCodeObjectVersion, !Ref CodeObjectVersion, !Ref AWS::NoValue]
+      Environment:
+        Variables: { TABLE_NAME: !Ref TableName }
+  SweepRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: local-sweeper
+          Arn: !GetAtt Worker.Arn
+          Input: '{"kind":"sweep"}'
+  SweepPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Worker
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweepRule.Arn
+Outputs:
+  SweeperArn:
+    Value: !GetAtt Worker.Arn

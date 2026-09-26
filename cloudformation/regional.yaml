@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy once in us-west-2 and once in us-east-1; both execute and sweep independently.
+Parameters:
+  TableName: { Type: String, Default: tanstack-workflow-aws }
+  CodeBucket: { Type: String, Description: S3 bucket containing the bundled Lambda ZIP in this Region }
+  CodeKey: { Type: String, Description: S3 key for examples/handler bundle }
+  CodeObjectVersion:
+    Type: String
+    Default: ''
+    Description: Optional S3 object version; otherwise use a new CodeKey for every deployment.
+Conditions:
+  HasCodeObjectVersion: !Not [!Equals [!Ref CodeObjectVersion, '']]
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkflowStore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/DueIndex
+  Worker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: handler.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !If [HasCodeObjectVersion, !Ref CodeObjectVersion, !Ref AWS::NoValue]
+      Environment:
+        Variables: { TABLE_NAME: !Ref TableName }
+  SweepWorker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: handler.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+        S3ObjectVersion: !If [HasCodeObjectVersion, !Ref CodeObjectVersion, !Ref AWS::NoValue]
+      Environment:
+        Variables: { TABLE_NAME: !Ref TableName }
+  SweepRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: local-sweeper
+          Arn: !GetAtt SweepWorker.Arn
+          Input: '{"kind":"sweep"}'
+  SweepPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SweepWorker
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweepRule.Arn
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties: { Name: !Sub 'workflow-${AWS::Region}', ProtocolType: HTTP }
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt Worker.Arn
+      PayloadFormatVersion: '2.0'
+  Route:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: '$default'
+      Target: !Sub integrations/${Integration}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: { ApiId: !Ref Api, StageName: '$default', AutoDeploy: true }
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Worker
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*
+Outputs:
+  ApiDomain:
+    Value: !Sub ${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  ApiUrl:
+    Value: !GetAtt Api.ApiEndpoint
