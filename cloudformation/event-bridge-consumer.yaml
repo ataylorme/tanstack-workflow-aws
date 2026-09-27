@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Optional application-event stream bridge; deploy once per destination in a chosen Region.
+Parameters:
+  StreamArn: { Type: String, Description: Regional DynamoDB Stream ARN for the workflow table }
+  CodeBucket: { Type: String, Description: Regional S3 bucket containing the bundled examples/event-bridge-handler.ts }
+  CodeKey: { Type: String, Description: S3 key of the Lambda ZIP containing handler.js }
+  BridgeKind:
+    Type: String
+    AllowedValues: [eventbridge, sns, sqs, webhook]
+  EventBusArn: { Type: String, Default: '' }
+  EventSource: { Type: String, Default: my.application }
+  TopicArn: { Type: String, Default: '' }
+  QueueArn: { Type: String, Default: '' }
+  QueueUrl: { Type: String, Default: '' }
+  WebhookUrl: { Type: String, Default: '' }
+  FailureQueueArn: { Type: String, Description: SQS queue ARN for exhausted stream batches }
+Conditions:
+  UseEventBridge: !Equals [!Ref BridgeKind, eventbridge]
+  UseSns: !Equals [!Ref BridgeKind, sns]
+  UseSqs: !Equals [!Ref BridgeKind, sqs]
+  UseWebhook: !Equals [!Ref BridgeKind, webhook]
+Resources:
+  BridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StreamAndDestination
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: !Ref StreamArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref FailureQueueArn
+              - !If
+                - UseEventBridge
+                - { Effect: Allow, Action: events:PutEvents, Resource: !Ref EventBusArn }
+                - !Ref AWS::NoValue
+              - !If
+                - UseSns
+                - { Effect: Allow, Action: sns:Publish, Resource: !Ref TopicArn }
+                - !Ref AWS::NoValue
+              - !If
+                - UseSqs
+                - { Effect: Allow, Action: sqs:SendMessage, Resource: !Ref QueueArn }
+                - !Ref AWS::NoValue
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: handler.handler
+      Role: !GetAtt BridgeRole.Arn
+      Timeout: 30
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey }
+      Environment:
+        Variables:
+          BRIDGE_KIND: !Ref BridgeKind
+          EVENT_BUS_NAME: !If [UseEventBridge, !Ref EventBusArn, '']
+          EVENT_SOURCE: !Ref EventSource
+          TOPIC_ARN: !If [UseSns, !Ref TopicArn, '']
+          QUEUE_URL: !If [UseSqs, !Ref QueueUrl, '']
+          WEBHOOK_URL: !If [UseWebhook, !Ref WebhookUrl, '']
+  StreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref StreamArn
+      FunctionName: !Ref BridgeFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 5
+      MaximumRecordAgeInSeconds: 86400
+      DestinationConfig:
+        OnFailure: { Destination: !Ref FailureQueueArn }
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["INSERT"],"dynamodb":{"NewImage":{"entityType":{"S":["APPLICATION_EVENT"]}}}}'
+Outputs:
+  FunctionArn: { Value: !GetAtt BridgeFunction.Arn }

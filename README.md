@@ -164,4 +164,4 @@ await events.publish({
 
 The shared MRSC table enables DynamoDB Streams with `NEW_IMAGE`, so applications can attach independent Lambda consumers for notifications, database projections, audit history, analytics, or workflow triggers without requiring EventBridge. Producers can supply a stable event `id` for idempotent retries; consumers must also be idempotent because stream delivery is at least once.
 
-See [the application events guide](docs/application-events.md).
+See [the application events guide](docs/application-events.md) for optional EventBridge, SNS, SQS, and HTTPS webhook bridges, independent stream consumer examples, and a deployable CloudFormation bridge template.

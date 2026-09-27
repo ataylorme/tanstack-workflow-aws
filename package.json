@@ -20,6 +20,26 @@
     "./events": {
       "types": "./dist/events.d.ts",
       "import": "./dist/events.js"
+    },
+    "./event-stream": {
+      "types": "./dist/event-stream.d.ts",
+      "import": "./dist/event-stream.js"
+    },
+    "./bridges/eventbridge": {
+      "types": "./dist/bridges-eventbridge.d.ts",
+      "import": "./dist/bridges-eventbridge.js"
+    },
+    "./bridges/sns": {
+      "types": "./dist/bridges-sns.d.ts",
+      "import": "./dist/bridges-sns.js"
+    },
+    "./bridges/sqs": {
+      "types": "./dist/bridges-sqs.d.ts",
+      "import": "./dist/bridges-sqs.js"
+    },
+    "./bridges/webhook": {
+      "types": "./dist/bridges-webhook.d.ts",
+      "import": "./dist/bridges-webhook.js"
     }
   },
   "files": [
@@ -42,14 +62,18 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.900.0",
     "@aws-sdk/lib-dynamodb": "^3.900.0",
-    "@standard-schema/spec": "^1.1.0",
-    "@opentelemetry/api": "^1.9.0"
+    "@aws-sdk/util-dynamodb": "^3.996.9",
+    "@opentelemetry/api": "^1.9.0",
+    "@standard-schema/spec": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.11",
-    "esbuild": "^0.25.0"
+    "@aws-sdk/client-eventbridge": "^3.1141.0",
+    "@aws-sdk/client-sns": "^3.1141.0",
+    "@aws-sdk/client-sqs": "^3.1141.0"
   },
   "engines": {
     "node": ">=20"
@@ -60,5 +84,21 @@
   },
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-eventbridge": "^3.1141.0",
+    "@aws-sdk/client-sns": "^3.1141.0",
+    "@aws-sdk/client-sqs": "^3.1141.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-eventbridge": {
+      "optional": true
+    },
+    "@aws-sdk/client-sns": {
+      "optional": true
+    },
+    "@aws-sdk/client-sqs": {
+      "optional": true
+    }
   }
 }
