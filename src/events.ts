@@ -81,13 +81,6 @@ export function createDynamoApplicationEventPublisher(
   }
 }
 
-export interface DynamoApplicationEventStreamRecord<T = unknown> {
-  eventName?: string
-  dynamodb?: {
-    NewImage?: Record<string, { S?: string; N?: string; M?: unknown }>
-  }
-}
-
 export interface ApplicationEventHandler<T = unknown> {
   (event: ApplicationEvent<T>): Promise<void> | void
 }
