@@ -143,3 +143,25 @@ cfn-lint cloudformation/*.yaml
 ```
 
 `npm test` runs unit checks and skips emulator suites unless `DYNAMODB_ENDPOINT` is configured. `test:integration` starts DynamoDB Local when given its JAR and runs all suites. Download DynamoDB Local from [AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html); Java 17 or later is required. Tests create and delete isolated tables and accept only localhost endpoints. They are not a live AWS test runner. See [the testing guide](docs/testing.md) for reproducible checks and the separate MRSC test plan.
+
+
+## Application events with DynamoDB Streams
+
+The package also exposes a generic application-event publisher at `@ataylorme/tanstack-workflow-aws/events`. Application events are deliberately separate from TanStack Workflow's internal replay log and can represent any domain fact.
+
+```ts
+import { createDynamoApplicationEventPublisher } from '@ataylorme/tanstack-workflow-aws/events'
+
+const events = createDynamoApplicationEventPublisher({
+  tableName: process.env.TABLE_NAME!,
+})
+
+await events.publish({
+  type: 'task.requested',
+  data: { taskId: 'task-123', requestedBy: 'user-456' },
+})
+```
+
+The shared MRSC table enables DynamoDB Streams with `NEW_IMAGE`, so applications can attach independent Lambda consumers for notifications, database projections, audit history, analytics, or workflow triggers without requiring EventBridge. Producers can supply a stable event `id` for idempotent retries; consumers must also be idempotent because stream delivery is at least once.
+
+See [the application events guide](docs/application-events.md).
