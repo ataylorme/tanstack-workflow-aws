@@ -13,6 +13,8 @@ Resources:
       TableName: !Ref TableName
       BillingMode: PAY_PER_REQUEST
       MultiRegionConsistency: STRONG
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
       AttributeDefinitions:
         - { AttributeName: PK, AttributeType: S }
         - { AttributeName: SK, AttributeType: S }
@@ -35,3 +37,5 @@ Resources:
 Outputs:
   TableName:
     Value: !Ref WorkflowTable
+  StreamArn:
+    Value: !GetAtt WorkflowTable.StreamArn
