@@ -16,9 +16,9 @@ cfn-lint cloudformation/*.yaml
 
 Install Java 17+ and download DynamoDB Local following [AWS's instructions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html). Alternatively, set `DYNAMODB_ENDPOINT` to an already-running local emulator. The integration runner creates isolated tables and deletes them afterwards. Its endpoint guard deliberately prevents using it against real AWS. A plain `npm test` without the emulator skips the Local suites; those skips are not integration passes.
 
-The package check builds a tarball, installs it in a clean consumer project, verifies all three public imports and typechecks the included store/runtime contract. It needs registry access or a populated npm cache. The upstream contract tests preserve their source commit and license provenance in the test file.
+The package check builds a tarball, installs it in a clean consumer project, verifies the public imports and typechecks the included store/runtime contract. It needs registry access or a populated npm cache. The upstream contract tests preserve their source commit and license provenance in the test file.
 
-## Reviewed result
+## Original workflow-runtime review result
 
 All **61 tests across 8 suites** passed with DynamoDB Local enabled. Typecheck, build, clean packed-consumer installation, all CloudFormation lint checks and both example Lambda bundles also passed. Three review agents completed two review passes, with an independent final read of the recovery fixes. No blocker for controlled AWS integration testing remained in those reviews. This is an engineering assessment, not a measured reliability percentage.
 
@@ -64,3 +64,12 @@ Use a disposable account or isolated stacks, small bounded workloads, cost limit
 9. **Bounds and operations:** measure event-chain latency, GSI hot partitions, clock skew, state growth, the 400 KB item limit and sweep capacity. Add alarms for failed/retried work and a retention/orphan cleanup procedure. Exercise deployment rollback with in-flight versions.
 
 Record actual outcomes, timings and run IDs. A failing acceptance case is a release blocker, even if every local test passes. No live AWS deployment, MRSC failover test or production load test was performed during the code review.
+
+## Application event readiness
+
+The event API and optional bridges have a separate [AWS test handoff](event-testing.md).
+Run `npm run test:package` to check the installable artifact and all optional exports,
+and run the full suite with DynamoDB Local for duplicate publication/conflict coverage.
+`node scripts/test-events-live.mjs` is an offline plan; `--execute` is explicitly required
+for the bounded live publisher/optional SQS checks. No AWS delivery outcome is implied
+by local or emulator passes. The application repository owns its own integration changes.

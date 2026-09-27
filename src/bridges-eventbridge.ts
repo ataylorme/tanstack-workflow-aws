@@ -1,3 +1,4 @@
+import { serializeApplicationEvent } from './event-validation.js'
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge'
 import type { ApplicationEventHandler } from './events.js'
 
@@ -17,7 +18,7 @@ export function createEventBridgeBridge(options: EventBridgeBridgeOptions): Appl
       Source: options.source,
       DetailType: `${event.type}.v${event.version}`,
       Time: new Date(event.timestamp),
-      Detail: JSON.stringify(event),
+      Detail: serializeApplicationEvent(event),
     }] }))
     if (result.FailedEntryCount || result.Entries?.[0]?.ErrorCode || !result.Entries?.[0]?.EventId) {
       throw new Error(`EventBridge publication failed: ${result.Entries?.[0]?.ErrorCode ?? 'missing event ID'}`)

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { marshall } from '@aws-sdk/util-dynamodb'
 import { PutEventsCommand } from '@aws-sdk/client-eventbridge'
@@ -29,16 +30,17 @@ describe('optional bridges', () => {
     await createSnsBridge({ topicArn: 'topic.fifo', messageGroupId: () => 'task-1', client: { send: snsSend } as any })(event)
     await createSqsBridge({ queueUrl: 'queue.fifo', messageGroupId: () => 'task-1', client: { send: sqsSend } as any })(event)
     expect(snsSend.mock.calls[0][0]).toBeInstanceOf(PublishCommand)
-    expect((snsSend.mock.calls[0][0] as PublishCommand).input).toMatchObject({ MessageDeduplicationId: event.id, MessageGroupId: 'task-1', Message: JSON.stringify(event) })
+    expect((snsSend.mock.calls[0][0] as PublishCommand).input).toMatchObject({ MessageDeduplicationId: createHash('sha256').update(event.id).digest('hex'), MessageGroupId: 'task-1', Message: JSON.stringify(event) })
     expect(sqsSend.mock.calls[0][0]).toBeInstanceOf(SendMessageCommand)
-    expect((sqsSend.mock.calls[0][0] as SendMessageCommand).input).toMatchObject({ MessageDeduplicationId: event.id, MessageGroupId: 'task-1', MessageBody: JSON.stringify(event) })
+    expect((sqsSend.mock.calls[0][0] as SendMessageCommand).input).toMatchObject({ MessageDeduplicationId: createHash('sha256').update(event.id).digest('hex'), MessageGroupId: 'task-1', MessageBody: JSON.stringify(event) })
   })
 
   it('POSTs HTTPS with an idempotency header and fails on non-2xx', async () => {
     const fetch = vi.fn(async () => ({ ok: false, status: 503 })) as any
     const bridge = createWebhookBridge({ url: 'https://example.com/events', fetch })
     await expect(bridge(event)).rejects.toThrow('503')
-    expect(fetch.mock.calls[0][1]).toMatchObject({ method: 'POST', redirect: 'error', headers: { 'x-event-id': 'stable-id' }, body: JSON.stringify(event) })
+    expect(fetch.mock.calls[0][1]).toMatchObject({ method: 'POST', redirect: 'error', body: JSON.stringify(event) })
+    expect(fetch.mock.calls[0][1].headers.get('x-event-id')).toBe('stable-id')
     expect(() => createWebhookBridge({ url: 'http://example.com/events' })).toThrow('HTTPS')
   })
 })

@@ -3,3 +3,5 @@ dist/
 .env
 build/
 dynamodb-local-metadata.json
+
+.event-test-results/

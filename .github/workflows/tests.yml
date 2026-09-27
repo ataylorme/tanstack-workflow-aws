@@ -45,7 +45,7 @@ jobs:
       - name: Verify installed package
         run: npm run test:package
       - name: Bundle Lambda examples
-        run: npx --no-install esbuild examples/handler.ts examples/sweeper.ts --bundle --platform=node --target=node22 --format=cjs --outdir=build/ci
+        run: npx --no-install esbuild examples/handler.ts examples/sweeper.ts examples/event-bridge-handler.ts examples/event-consumer.ts --bundle --platform=node --target=node22 --format=cjs --outdir=build/ci
       - uses: actions/setup-python@v5
         if: matrix.node == 22
         with:

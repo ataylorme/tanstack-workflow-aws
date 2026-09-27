@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { serializeApplicationEvent } from './event-validation.js'
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs'
 import type { ApplicationEvent, ApplicationEventHandler } from './events.js'
 
@@ -10,13 +12,14 @@ export interface SqsBridgeOptions {
 
 export function createSqsBridge(options: SqsBridgeOptions): ApplicationEventHandler {
   if (!options.queueUrl) throw new Error('queueUrl is required')
+  if (options.queueUrl.endsWith('.fifo') && !options.messageGroupId) throw new Error('messageGroupId is required for FIFO destinations')
   const client = options.client ?? new SQSClient({})
   return async event => {
     await client.send(new SendMessageCommand({
       QueueUrl: options.queueUrl,
-      MessageBody: JSON.stringify(event),
+      MessageBody: serializeApplicationEvent(event),
       MessageAttributes: { eventType: { DataType: 'String', StringValue: event.type } },
-      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: event.id } : {}),
+      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: createHash('sha256').update(event.id).digest('hex') } : {}),
     }))
   }
 }

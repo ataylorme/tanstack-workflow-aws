@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+import { serializeApplicationEvent } from './event-validation.js'
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns'
 import type { ApplicationEvent, ApplicationEventHandler } from './events.js'
 
@@ -10,13 +12,14 @@ export interface SnsBridgeOptions {
 
 export function createSnsBridge(options: SnsBridgeOptions): ApplicationEventHandler {
   if (!options.topicArn) throw new Error('topicArn is required')
+  if (options.topicArn.endsWith('.fifo') && !options.messageGroupId) throw new Error('messageGroupId is required for FIFO destinations')
   const client = options.client ?? new SNSClient({})
   return async event => {
     await client.send(new PublishCommand({
       TopicArn: options.topicArn,
-      Message: JSON.stringify(event),
+      Message: serializeApplicationEvent(event),
       MessageAttributes: { eventType: { DataType: 'String', StringValue: event.type } },
-      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: event.id } : {}),
+      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: createHash('sha256').update(event.id).digest('hex') } : {}),
     }))
   }
 }

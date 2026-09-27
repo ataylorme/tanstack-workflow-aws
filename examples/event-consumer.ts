@@ -10,8 +10,9 @@ async function project(event: ApplicationEvent) {
   console.log('project', event.id, event.data)
 }
 
-// In production, give each side effect its own Lambda stream mapping so a
-// notification outage cannot block a projection; deduplicate by event.id.
+// These are alternative entrypoints. For a global table, use one stream reader
+// and fan out through queues if independent side-effect retries are needed.
+// Every real consumer must deduplicate by event.id.
 export const notificationHandler = createApplicationStreamHandler(event =>
   routeApplicationEvent(event, [
     { type: 'task.requested', handler: notify },
