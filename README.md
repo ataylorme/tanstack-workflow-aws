@@ -1,6 +1,6 @@
 # tanstack-workflow-aws
 
-An experimental `WorkflowExecutionStore` package for **TanStack Workflow** on AWS. It provides a DynamoDB execution store and a runnable, two-Region Lambda/EventBridge/CloudFront example. It does not use Vercel Workflow.
+An experimental `WorkflowExecutionStore` package for **TanStack Workflow** on AWS. It provides a DynamoDB execution store and a runnable, two-Region Lambda/EventBridge Scheduler/SQS/CloudFront example. It does not use Vercel Workflow.
 
 The package implements the included TanStack Workflow snapshot’s store interface. Import the matching engine from this package’s `/workflow` and `/runtime` entry points; see [snapshot provenance and packaging](docs/packaging.md). Both `us-west-2` and `us-east-1` may accept requests, execute workflows and sweep due work independently. They use their local replica of one **MRSC** DynamoDB Global Table; a witness in `us-east-2` forms the third quorum member. The same run can resume in either application Region.
 
@@ -16,14 +16,18 @@ flowchart TB
 
     subgraph west["us-west-2"]
         westApi["API Gateway HTTP API"] --> westWorker["Request Lambda<br/>Workflow runtime + store"]
-        westEvents["EventBridge<br/>Every minute"] --> westSweep["Sweep Lambda<br/>Workflow runtime + store"]
+        westTable --> westDispatch["Stream dispatcher"]
+        westDispatch --> westSchedule["One-time Scheduler / SQS"]
+        westSchedule --> westSweep["Sweep Lambda<br/>Workflow runtime + store"]
         westWorker --> westTable[("DynamoDB replica<br/>Run state, events, timers, schedules<br/>DueIndex")]
         westSweep --> westTable
     end
 
     subgraph east["us-east-1"]
         eastApi["API Gateway HTTP API"] --> eastWorker["Request Lambda<br/>Workflow runtime + store"]
-        eastEvents["EventBridge<br/>Every minute"] --> eastSweep["Sweep Lambda<br/>Workflow runtime + store"]
+        eastTable --> eastDispatch["Stream dispatcher"]
+        eastDispatch --> eastSchedule["One-time Scheduler / SQS"]
+        eastSchedule --> eastSweep["Sweep Lambda<br/>Workflow runtime + store"]
         eastWorker --> eastTable[("DynamoDB replica<br/>Run state, events, timers, schedules<br/>DueIndex")]
         eastSweep --> eastTable
     end
@@ -39,7 +43,7 @@ flowchart TB
     eastTable -.-> witness
 ```
 
-Solid arrows show request, invocation and store access paths; dotted links show witness participation in the MRSC quorum, not application access. Both Regions independently sweep due work, with conditional writes and leases coordinating ownership. Lambda@Edge provides placement, **not automatic POST failover**. The Global Table is provisioned by one CloudFormation stack, not one per replica. See [the standalone deployment](#standalone-aws-example) and [the existing-app integration guide](docs/tanstack-start-lambda-web-adapter.md).
+Solid arrows show request, invocation and store access paths; dotted links show witness participation in the MRSC quorum, not application access. Both Regions independently wake due work from committed state changes and one-time deadlines, with conditional writes and leases coordinating ownership. No permanent minute-based rule is needed. Installing the store alone does not install this wakeup path; deploy the example infrastructure described in [demand-driven wakeups](docs/workflow-wakeups.md). Lambda@Edge provides placement, **not automatic POST failover**. The Global Table is provisioned by one CloudFormation stack, not one per replica. See [the standalone deployment](#standalone-aws-example) and [the existing-app integration guide](docs/tanstack-start-lambda-web-adapter.md).
 
 ## Install and use
 
@@ -84,7 +88,7 @@ Pass `leaseOwner: owner` to `runtime.deliverSignal`, `runtime.deliverApproval` a
 
 This relies on **MRSC** conditional writes and strongly consistent reads. Ordinary MREC Global Tables can accept the same local conditional claim in two Regions and are unsafe for this active/active design. MRSC has no DynamoDB transactions or TTL; explicit retention and orphan cleanup are application responsibilities. The run item also stores delivered signal IDs for atomic deduplication. Large run state, a high number of signal IDs or an event batch above DynamoDB's 400 KB item limit will fail; this prototype does not spill payloads to external storage. Event reads walk the entire chain and administrative `listRuns` uses a table Scan. `DueIndex` currently uses four unsharded partition values (`RUNNING`, `TIMER_RUN`, `TIMER`, `SCHEDULE`), so it needs a shard design and load testing at high throughput.
 
-A GSI is eventually consistent even on an MRSC table. A new timer or newly expired lease may be discovered on a later sweep. Duplicate EventBridge invocations and candidate reads are harmless to claims, but **external side effects still require idempotency keys** because a worker can die after a side effect and before its completion event commits. Keep clock skew below the lease margin; use a lease longer than the maximum expected store write and heartbeat interval. A lost MRSC quorum prevents writes; no store can continue safely in a single isolated Region under this consistency model.
+A GSI is eventually consistent even on an MRSC table. The wakeup worker persists a continuation before acknowledging unresolved work, including delayed index visibility. Duplicate queue deliveries and candidate reads are harmless to claims, but **external side effects still require idempotency keys** because a worker can die after a side effect and before its completion event commits. Keep clock skew below the lease margin; use a lease longer than the maximum expected store write and heartbeat interval. A lost MRSC quorum prevents writes; no store can continue safely in a single isolated Region under this consistency model.
 
 Queued runs and expired or released running leases are sweep candidates. Accepted signals and approvals persist their payload with the deduplication ID; recovery publishes the resolution event and clears that payload atomically. Schedule policies `allow` and `skip` are supported; `buffer-one`, `cancel-previous` and `terminate-previous` are rejected. Schedule metadata changed during this pre-release review: use a fresh test table rather than mixing old prototype workers or records with this implementation.
 
@@ -94,37 +98,32 @@ The library implements TanStack Workflow's store contract for a Node.js runtime.
 
 ## TanStack Start with Lambda Web Adapter and Aurora DSQL
 
-For an existing Start application in `us-east-1` and `us-west-2`, use this package in server functions/routes alongside your DSQL client. DSQL remains the application database; DynamoDB MRSC holds workflow coordination and history. The recommended deployment adds a dedicated EventBridge sweep Lambda in each application Region, sharing the same workflow definitions as the web application. Reuse the application's existing CloudFront/Lambda@Edge ingress.
+For an existing Start application in `us-east-1` and `us-west-2`, use this package in server functions/routes alongside your DSQL client. DSQL remains the application database; DynamoDB MRSC holds workflow coordination and history. The recommended deployment adds a stream dispatcher, one-time EventBridge Scheduler schedules, and an SQS-backed sweep Lambda in each application Region, sharing the same workflow definitions as the web application. Reuse the application's existing CloudFront/Lambda@Edge ingress.
 
 See [the integration guide](docs/tanstack-start-lambda-web-adapter.md) for request ownership, bounded execution, the DSQL outbox boundary, and the dedicated [sweeper template](cloudformation/sweeper.yaml). These integration files do not provision or modify DSQL clusters or your Start application.
 
 ## Standalone AWS example
 
-Deploy the three templates in this order. This example deploys real, billable resources; inspect and adapt its public API, IAM, retention and monitoring settings before running it. CloudFormation controls the Global Table **from one stack in one Region**.
+Deploy the table once, then the API and demand-driven wakeup stacks in each application Region, and finally the edge stack. These are real, billable resources; inspect public API, IAM, retention and monitoring settings first.
 
-1. Build the example Lambda bundle and upload the ZIP to an S3 bucket in each application Region:
-
-   ```sh
-   npm ci
-   npm run build
-   mkdir -p build/lambda
-   npx esbuild examples/handler.ts --bundle --platform=node --target=node22 --format=cjs --outfile=build/lambda/handler.js
-   (cd build/lambda && zip ../workflow-handler.zip handler.js)
-   aws s3 cp build/workflow-handler.zip s3://YOUR-WEST-BUCKET/workflow-handler.zip --region us-west-2
-   aws s3 cp build/workflow-handler.zip s3://YOUR-EAST-BUCKET/workflow-handler.zip --region us-east-1
-   ```
-
-2. Deploy `cloudformation/global-table.yaml` **once**, from `us-west-2`. Wait until both replicas are ACTIVE. It creates replicas in `us-west-2` and `us-east-1` and a witness in `us-east-2`. Do not deploy the same table template again in N. Virginia.
+1. Deploy `cloudformation/global-table.yaml` **once**, from `us-west-2`, and wait for both replicas to become ACTIVE:
 
    ```sh
-   aws cloudformation deploy --region us-west-2 --stack-name workflow-table --template-file cloudformation/global-table.yaml
+   export AWS_PROFILE=YOUR_SANDBOX_PROFILE
+   export TABLE_NAME=YOUR_WORKFLOW_TABLE
+   export TABLE_STACK=YOUR_TABLE_STACK
+   aws cloudformation deploy --region us-west-2 --stack-name "$TABLE_STACK" \
+     --template-file cloudformation/global-table.yaml \
+     --parameter-overrides "TableName=$TABLE_NAME"
    ```
 
-   For an explicit CloudFormation execution role (including temporary-credential deployment troubleshooting), see [MRSC provisioning and safe rollback recovery](docs/mrsc-deployment.md). Do not delete an existing application table to retry provisioning.
+   See [MRSC provisioning and safe rollback recovery](docs/mrsc-deployment.md) before retrying a partial deployment. Do not delete an existing table.
+2. Build and upload the combined `handler.js`, `sweeper.js`, and `dispatcher.js` ZIP using the commands in [the wakeup deployment guide](docs/workflow-wakeups.md#build-and-deploy). Keep the same `TABLE_NAME`, use a new immutable S3 key for each build, and use a bucket local to each Region.
+3. Deploy `cloudformation/regional.yaml` in **each** application Region with `TableName`, local `CodeBucket`, immutable `CodeKey`, `LegacyScheduleMode=removed`, and `--capabilities CAPABILITY_IAM`. This is the standalone HTTP API; fresh stacks have no integrated periodic sweeper.
+4. Deploy `cloudformation/sweeper.yaml` in **each** application Region using the same ZIP and its regional table `StreamArn`, following [the complete commands](docs/workflow-wakeups.md#build-and-deploy). This separate stack is required for background recovery and durable timers, including when using the standalone API.
+5. Deploy `cloudformation/edge.yaml` **only in `us-east-1`** with `WestApiDomain` and `EastApiDomain` from the API stacks and `--capabilities CAPABILITY_IAM`. CloudFront uses a versioned Lambda@Edge function to hash `x-workflow-run-id` (or URL path) across the APIs.
 
-3. Deploy `cloudformation/regional.yaml` in **each** application Region with its local S3 bucket and `CodeKey=workflow-handler.zip`. Pass `--capabilities CAPABILITY_IAM`. Read the `ApiDomain` output of both stacks.
-
-4. Deploy `cloudformation/edge.yaml` **only in `us-east-1`** with `WestApiDomain` and `EastApiDomain` from step 3 and `--capabilities CAPABILITY_IAM`. CloudFront uses a versioned Lambda@Edge function at the origin-request event. The edge function hashes `x-workflow-run-id` (or URL path) to distribute requests across the two APIs. The two regional EventBridge rules independently invoke their local sweep Lambda every minute.
+For an existing deployment, **do not remove its recurring rule before enabling and reconciling the replacement**. Follow [migration and rollback](docs/workflow-wakeups.md#migrate-existing-polling-stacks).
 
 The example accepts `POST /runs` with required `x-workflow-run-id` and JSON input, and `POST /runs/{id}/signals` with JSON `{ "signalId": "stable-id", "message": "done" }`. The workflow pauses for the `complete` signal and may resume in either Region. Invoke the CloudFront `Endpoint` output. Supply stable run and signal IDs on retries. The example does not configure an API authorizer; add authentication, access controls, alarms and throttling before exposing it to untrusted users.
 

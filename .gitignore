@@ -5,3 +5,7 @@ build/
 dynamodb-local-metadata.json
 
 .event-test-results/
+
+# Local deployment evidence and credentials must never enter the published package/repository.
+.deploy/
+.omx/

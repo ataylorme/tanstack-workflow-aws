@@ -16,8 +16,8 @@ try {
   execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', join(temporary, tarballName)], {
     cwd: temporary, stdio: 'inherit',
   })
-  for (const service of ['eventbridge', 'sns', 'sqs']) {
-    if (existsSync(join(temporary, 'node_modules/@aws-sdk/client-' + service))) throw new Error('Optional bridge SDK unexpectedly installed: ' + service)
+  for (const service of ['eventbridge', 'sns', 'sqs', 'scheduler']) {
+    if (existsSync(join(temporary, 'node_modules/@aws-sdk/client-' + service))) throw new Error('Optional bridge/example SDK unexpectedly installed: ' + service)
   }
   writeFileSync(join(temporary, 'consumer.mjs'), `
 import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'

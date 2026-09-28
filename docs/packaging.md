@@ -19,7 +19,7 @@ This packs the package, installs the tarball into an unrelated temporary project
 
 ## Updating the AWS examples
 
-Upload each new regional Lambda bundle under a new, immutable S3 `CodeKey`, or enable S3 versioning and pass the new `CodeObjectVersion`. CloudFormation does not detect overwritten bytes at the same S3 bucket/key. Both the standalone API and its separate sweep Lambda use the supplied bundle; the sweeper-only template supplies a function for an existing application.
+Upload each new regional Lambda bundle under a new, immutable S3 `CodeKey`, or enable S3 versioning and pass the new `CodeObjectVersion`. CloudFormation does not detect overwritten bytes at the same S3 bucket/key. Bundle `handler.js`, `sweeper.js`, and `dispatcher.js` together as described in [demand-driven wakeups](workflow-wakeups.md). The standalone API uses `regional.yaml`; both standalone and existing applications deploy `sweeper.yaml` separately in each Region. Its stream dispatcher and SQS worker use the same artifact. The Scheduler SDK is an example build dependency, not an automatic library feature; install it when copying these examples into another application.
 
 The edge template's `RouterRevision` must change whenever its inline routing code changes. Its published version description also includes both API domains, so a changed endpoint creates a new version and updates the CloudFront association. Old edge versions are retained because CloudFront replicas cannot be deleted immediately after association changes; remove unused versions manually after replication has completed and AWS allows deletion.
 

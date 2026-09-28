@@ -1,6 +1,6 @@
 # Application events with DynamoDB Streams
 
-The application event API is generic and independent of TanStack Workflow's internal replay log. It stores immutable domain facts in DynamoDB. DynamoDB Streams triggers consumers; EventBridge is optional. The API is not a transactional outbox or a durable consumer registry.
+The application event API is generic and independent of TanStack Workflow's internal replay log. It stores immutable domain facts in DynamoDB. DynamoDB Streams triggers consumers; EventBridge is optional. The API is not a transactional outbox or a durable consumer registry. Application-event bridges remain stream-triggered and separate from [workflow deadline wakeups](workflow-wakeups.md). Publishing an application event does not itself schedule a workflow: an application consumer must durably start or signal that workflow; its resulting workflow metadata drives the wakeup dispatcher.
 
 ## Publish and retry
 

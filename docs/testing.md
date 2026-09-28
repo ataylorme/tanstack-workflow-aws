@@ -53,13 +53,13 @@ The DynamoDB host hook defers failed run recovery for 60 seconds. Pending-resolu
 
 Use a disposable account or isolated stacks, small bounded workloads, cost limits and logs that include run ID, owner, Region and workflow version. Provision the MRSC table once with east/west replicas and the Ohio witness. Deploy compatible workflow registries and separate sweep Lambdas in both Regions. Keep workflow definitions available for every in-flight version.
 
-1. **Deployment and package:** build from the reviewed commit, install the tarball in the actual application build, deploy templates, and confirm both local DynamoDB endpoints and IAM roles work. Verify both EventBridge targets are the sweep Lambdas. Exercise the standalone API or your Start/Lambda Web Adapter integration.
+1. **Deployment and package:** build from the reviewed commit, install the tarball in the actual application build, deploy templates, and confirm both local DynamoDB endpoints and IAM roles work. Verify each regional stream dispatcher and Scheduler-to-SQS-to-sweeper path is enabled, with no recurring sweep rule. Exercise the standalone API or your Start/Lambda Web Adapter integration.
 2. **Concurrent claims:** submit the same run ID concurrently to both Regions. Repeat with the same signal ID and schedule tick. Verify a single committed event chain, one accepted delivery and one bucket ownership at a time. Measure conflict retries.
 3. **Interrupted work:** terminate a worker after run creation, signal/approval acceptance, event staging, event publication, persisted timer wait, and schedule claim. Confirm the other sweeper resumes the same run and retains the original payload. Repeat with an intentionally expired lease and a stale worker attempting to write.
 4. **Network uncertainty:** inject response loss/timeouts around writes. Verify that retries neither erase an acknowledged delivery nor publish partial event batches. Inspect unreachable event segments separately from committed history.
 5. **Regional disruption:** block one application's DynamoDB access or stop its workers, then verify the other Region progresses while quorum remains available. Also test loss of quorum: writes must fail rather than allow divergent execution. Restore access and observe eventual recovery.
 6. **Routing:** verify mutation retries reach a healthy regional endpoint with the same IDs. The edge example distributes traffic; it does not automatically fail over POST requests. Check your own health-routing mechanism separately.
-7. **Scheduling and timing:** test both supported overlap policies, expired bucket leases, duplicate EventBridge invocations, delayed GSI discovery, and several consecutive sleeps. Change schedule inputs while a previous bucket is pending and verify that the accepted bucket retains its original input.
+7. **Scheduling and timing:** test both supported overlap policies, expired bucket leases, duplicate one-time wakeups and SQS deliveries, delayed GSI discovery, and several consecutive sleeps. Change schedule inputs while a previous bucket is pending and verify that the accepted bucket retains its original input.
 8. **Application effects:** inject a crash after a DSQL/business transaction but before the workflow event commits. Verify per-step idempotency and transactional outbox reconciliation. These application mechanisms are not implemented by the package.
 9. **Bounds and operations:** measure event-chain latency, GSI hot partitions, clock skew, state growth, the 400 KB item limit and sweep capacity. Add alarms for failed/retried work and a retention/orphan cleanup procedure. Exercise deployment rollback with in-flight versions.
 
@@ -73,3 +73,9 @@ and run the full suite with DynamoDB Local for duplicate publication/conflict co
 `node scripts/test-events-live.mjs` is an offline plan; `--execute` is explicitly required
 for the bounded live publisher/optional SQS checks. No AWS delivery outcome is implied
 by local or emulator passes. The application repository owns its own integration changes.
+
+### Demand-driven wakeup acceptance
+
+Test the [wakeup example](workflow-wakeups.md) beyond store unit tests: consecutive sleeps; abandonment after durable state writes; execution/timer-claim lease expiry; delayed index visibility; more pending items than one sweep batch; stale or duplicate messages; failure during schedule creation; and worker timeout before acknowledgement. Disable one regional processing path, verify the other recovers, restore it in `finally`, then repeat in the opposite direction. Exercise queue DLQ redrive and reconciliation after a stream retention gap.
+
+After outstanding deadlines and obsolete wakeups drain, observe at least 15 idle minutes with zero dispatcher/sweeper invocations, empty processing queues, no failure alarms, and no recurring rules. Indefinite signal and approval waits should remain idle; intentionally recurring application schedules are not idle work. Verify application-event delivery independently: its bridge is not the workflow scheduler.

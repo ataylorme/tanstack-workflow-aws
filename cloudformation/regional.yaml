@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Deploy once in us-west-2 and once in us-east-1; both execute and sweep independently.
+Description: Regional request API; deploy demand-driven background workers separately using sweeper.yaml in each Region.
 Parameters:
   TableName: { Type: String, Default: tanstack-workflow-aws }
   CodeBucket: { Type: String, Description: S3 bucket containing the bundled Lambda ZIP in this Region }
@@ -8,7 +8,14 @@ Parameters:
     Type: String
     Default: ''
     Description: Optional S3 object version; otherwise use a new CodeKey for every deployment.
+  LegacyScheduleMode:
+    Type: String
+    Default: removed
+    AllowedValues: [enabled, disabled, removed]
+    Description: Migration only; remove after the separate demand-driven wakeup stack is verified.
 Conditions:
+  KeepLegacySchedule: !Not [!Equals [!Ref LegacyScheduleMode, removed]]
+  EnableLegacySchedule: !Equals [!Ref LegacyScheduleMode, enabled]
   HasCodeObjectVersion: !Not [!Equals [!Ref CodeObjectVersion, '']]
 Resources:
   LambdaRole:
@@ -47,6 +54,7 @@ Resources:
       Environment:
         Variables: { TABLE_NAME: !Ref TableName }
   SweepWorker:
+    Condition: KeepLegacySchedule
     Type: AWS::Lambda::Function
     Properties:
       Runtime: nodejs22.x
@@ -61,15 +69,17 @@ Resources:
       Environment:
         Variables: { TABLE_NAME: !Ref TableName }
   SweepRule:
+    Condition: KeepLegacySchedule
     Type: AWS::Events::Rule
     Properties:
       ScheduleExpression: rate(1 minute)
-      State: ENABLED
+      State: !If [EnableLegacySchedule, ENABLED, DISABLED]
       Targets:
         - Id: local-sweeper
           Arn: !GetAtt SweepWorker.Arn
           Input: '{"kind":"sweep"}'
   SweepPermission:
+    Condition: KeepLegacySchedule
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
