@@ -19,6 +19,7 @@ Deploy the independent path in both application Regions. Application-event deliv
 - The sweeper retains runtime lease ownership/fencing, bounded execution, partial-batch retries, and durable continuations before acknowledging unresolved work. A temporarily empty, eventually consistent `DueIndex` is not proof that the triggering work completed.
 - Independent regional delivery intentionally produces duplicates. MRSC conditional writes coordinate claims; external effects still need idempotency keys. This design does not provide exactly-once external delivery.
 - Completed runs and indefinite signal/approval waits need no recurring wakeups. New durable transitions resume processing. An intentionally recurring workflow schedule still produces recurring work.
+- The default SQS mapping has no maximum-concurrency cap, allowing [Lambda’s low-traffic polling optimization](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-scaling.html). Empty queues still incur polling requests. The explicit empty `ScalingConfig` clears existing caps; adding a cap disables that optimization. Bursts can cause redundant shared due-work reads, so validate concurrent claims and regional recovery for your workload before changing scaling.
 - Removing periodic polling eliminates those idle invocations and queries, **not all AWS charges**. Provisioned resources, storage, retained logs, and actual workflow/event activity can still cost money.
 
 ## Build and deploy

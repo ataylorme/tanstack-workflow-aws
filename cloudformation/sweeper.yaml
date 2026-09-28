@@ -258,8 +258,8 @@ Resources:
       EventSourceArn: !GetAtt WakeupQueue.Arn
       FunctionName: !Ref Worker
       BatchSize: 1
-      # Each invocation sweeps shared due work; bound duplicate regional scans.
-      ScalingConfig: { MaximumConcurrency: 2 }
+      # Explicitly clear any deployed cap to allow low-traffic polling optimization.
+      ScalingConfig: {}
       FunctionResponseTypes: [ReportBatchItemFailures]
   IteratorAgeAlarm:
     Type: AWS::CloudWatch::Alarm
