@@ -1,6 +1,6 @@
 {
   "name": "@ataylorme/tanstack-workflow-aws",
-  "version": "0.2.0-rc.0",
+  "version": "0.2.0-rc.1",
   "type": "module",
   "description": "Experimental AWS DynamoDB execution store for TanStack Workflow",
   "license": "MIT",
