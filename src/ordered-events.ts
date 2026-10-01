@@ -187,7 +187,7 @@ export function createDynamoOrderedSubscriber(options: OrderedSubscriberOptions)
           await process(JSON.parse(message.body), context)
         } catch (error) {
           console.error(JSON.stringify({ kind: 'ordered_delivery_blocked', subscriberId: options.subscriberId,
-            messageId: message.messageId, error: error instanceof Error ? error.message : 'Error' }))
+            messageId: message.messageId, error: error instanceof Error ? error.name : 'Error' }))
           // FIFO batches must not acknowledge later messages after a failure.
           return { batchItemFailures: batch.Records.slice(i).map(record => ({ itemIdentifier: record.messageId })) }
         }
