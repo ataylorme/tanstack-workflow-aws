@@ -30,7 +30,7 @@ try {
   for (const { Table: table } of descriptions) {
     assert.equal(table?.TableStatus, 'ACTIVE')
     assert.equal(table?.MultiRegionConsistency, 'STRONG', 'Use MRSC; an MREC table is not a coordination substitute')
-    assert.ok(['NEW_IMAGE', 'NEW_AND_OLD_IMAGES'].includes(table?.StreamSpecification?.StreamViewType), 'Enable application event images')
+    assert.equal(table?.StreamSpecification?.StreamViewType, 'NEW_AND_OLD_IMAGES', 'Enable old and new images for the unified router')
     assert.ok(table?.LatestStreamArn, 'Missing regional stream ARN')
     assert.equal(table?.TableName, tableName)
     accounts.push(table.TableArn.split(':')[4])

@@ -3,7 +3,8 @@
  * packages/workflow-runtime/tests/contracts/workflow-execution-store.contract.ts
  * Copyright (c) 2025 Tanner Linsley. MIT; see ../src/vendor/tanstack/LICENSE and NOTICE.md.
  * Adaptations: local package imports, per-test local DynamoDB fixture, owner binding
- * required by this distributed adapter, and explicit createRun before event-only append.
+ * required by this distributed adapter, explicit createRun before event-only append,
+ * and generation-qualified schedule bucket IDs.
  */
 import { afterEach, describe, expect, it } from 'vitest'
 import { randomUUID } from 'node:crypto'
@@ -384,9 +385,9 @@ export function runWorkflowExecutionStoreContractTests(
       expect(buckets).toHaveLength(1)
       expect(buckets[0]).toMatchObject({
         scheduleId: 'intent-process',
-        bucketId: '900000',
+        bucketId: '1:900000',
         workflowId: 'intent-process',
-        runId: 'intent-process:intent-process:900000',
+        runId: 'intent-process:intent-process:1:900000',
         fireAt: 900_000,
         input: { triggeredAt: 900_000 },
         overlapPolicy: 'skip',
@@ -415,7 +416,7 @@ export function runWorkflowExecutionStoreContractTests(
       })
       await (store as FencedWorkflowExecutionStore).withLeaseOwner('worker-a', () => store.markScheduleBucketStarted({
         scheduleId: 'intent-process',
-        bucketId: '900000',
+        bucketId: '1:900000',
         runId: buckets[0]!.runId,
         now: 900_000,
       }))
@@ -460,7 +461,7 @@ export function runWorkflowExecutionStoreContractTests(
       })
       await (store as FencedWorkflowExecutionStore).withLeaseOwner('worker-a', () => store.markScheduleBucketStarted({
         scheduleId: 'intent-discover-every-6h',
-        bucketId: '1780077600000',
+        bucketId: '1:1780077600000',
         runId: first[0]!.runId,
         now: 1_780_092_000_000,
       }))
@@ -475,13 +476,13 @@ export function runWorkflowExecutionStoreContractTests(
       expect(first).toHaveLength(1)
       expect(first[0]).toMatchObject({
         scheduleId: 'intent-discover-every-6h',
-        bucketId: '1780077600000',
+        bucketId: '1:1780077600000',
         workflowId: 'intent-discover-workflow',
       })
       expect(second).toHaveLength(1)
       expect(second[0]).toMatchObject({
         scheduleId: 'intent-process-every-15m',
-        bucketId: '1780092000000',
+        bucketId: '1:1780092000000',
         workflowId: 'intent-process-workflow',
       })
     })
@@ -669,7 +670,7 @@ export function runWorkflowExecutionStoreContractTests(
       expect(timerSweep.timers[0]?.kind).toBe('completed')
       expect(scheduleSweep.scheduled[0]).toMatchObject({
         kind: 'completed',
-        runId: 'scheduled:scheduled-every-15:900000',
+        runId: 'scheduled:scheduled-every-15:1:900000',
       })
     })
   })

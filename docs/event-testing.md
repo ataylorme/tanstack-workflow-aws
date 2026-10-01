@@ -1,53 +1,29 @@
-# Application event AWS test readiness
+# Application event AWS acceptance testing
 
-This guide is the package handoff for `tanstack-start-aws-high-availability` (its `test/tanstack-workflow-aws` branch). Application endpoints, UI, deployment orchestration and production side-effect logic belong to that repository. This PR prepares the package; it does not deploy or modify the application.
-
-## Use the exact candidate
-
-The previously published `0.1.0` does not contain this event API. This PR prepares `0.2.0-rc.0`; changing the manifest does **not** publish it. Test either a tarball built from this PR's exact commit or the exact prerelease after a maintainer publishes it. Do not use an unpinned branch or assume `latest` contains these changes.
+Build and install a tarball from the exact reviewed commit. Record the commit, tarball SHA-256, application commit and stack outputs alongside test evidence. The application and private workers must use the same package artifact.
 
 ```sh
-# In this package's checkout at the reviewed commit:
 npm ci
 npm run typecheck
 npm run build
 npm run test:package
 npm pack --pack-destination /path/to/shared-artifacts
-# In the application repository, its integration owner installs that exact file:
-# npm install --save-exact /path/to/shared-artifacts/ataylorme-tanstack-workflow-aws-0.2.0-rc.0.tgz
 ```
 
-Record the package commit, tarball SHA-256 and application commit alongside AWS evidence. The application build and native consumer bundle must use the same reviewed package. A file dependency must also be copied into the Docker build context before `npm ci`; alternatively use an exact published prerelease with existing GitHub Packages authentication. Select only needed optional SDK peers. `npm run test:package` verifies the installed tarball, no optional clients in a core-only install, every bridge subpath, generic payload types, and compatibility with AWS Lambda's `DynamoDBStreamHandler` under strict TypeScript settings.
+## Isolated deployment
 
-## Application integration contract
+Provision the MRSC table and regional [workers stacks](workflow-wakeups.md). Verify `STRONG` consistency, active east/west replicas and the Ohio witness. Each regional stream must use `NEW_AND_OLD_IMAGES` and exactly one enabled router mapping. Confirm its filter, `ReportBatchItemFailures`, retry limits and S3 failure destination. Confirm both SQS mappings are enabled.
 
-| Integration owner supplies | Package supplies |
-| --- | --- |
-| Same isolated MRSC table name in east and west; Ohio witness | Conditional immutable event writes and strong-read retry reconciliation |
-| Producer role with `dynamodb:PutItem` and `dynamodb:GetItem` on that table | Stable IDs, original-envelope returns on duplicates, conflict rejection |
-| Stable ID per domain transition, JSON payload/schema and correlation | Generic `ApplicationEvent<T>` envelope; no task-specific runtime behavior |
-| Stream enabled with `NEW_IMAGE` or `NEW_AND_OLD_IMAGES` | INSERT decoder that ignores internal workflow/receipt records |
-| One Region-local stream mapping, matching Lambda bundle and IAM | Handler returning partial batch failure sequence numbers, structured failure logs |
-| Event source mapping with `ReportBatchItemFailures`, retry/age bounds and failure archive | Example template and one selected optional bridge |
-| Destination idempotency; unordered-arrival handling; state-to-event recovery | At-least-once transport only; no cross-item transaction or side-effect atomicity |
-| Region/SDK request timeouts and integration-specific validation | Injectable SDK clients and a remaining-Lambda-time guard |
+Create a dedicated standard SQS test queue and subscribe it to the application SNS topic with **raw message delivery enabled** and a queue policy allowing that topic. The smoke runner must read this observation queue, not the application work queue competing with its Lambda consumer. Cross-account or customer-managed encryption requires additional policies. Do not use a business queue for the test.
 
-Do not wire a new bridge inside the HTTP `publish()` operation. Publishing acknowledges durable DynamoDB storage; delivery happens asynchronously. Check downstream delivery independently. The example CloudFormation consumer is private: do not add a public Function URL. Both app Regions may publish; start with the consumer only in one chosen Region. Do not create four competing readers on a global-table shard. EventBridge is needed only if that optional bridge is selected; workflow timer infrastructure is separate.
+The application owns authenticated endpoints, payload schemas, stable operation IDs, state-to-event handoff and consumer idempotency. Publishing acknowledges durable DynamoDB storage; verify downstream delivery separately. The workflow outbox should be tested through a workflow using `publishWorkflowEvent`, as well as the direct publisher below.
 
-## Prepare an isolated destination
+## Bounded smoke runner
 
-Use a disposable test table/stack and a dedicated standard SQS queue. The queue is a simple observable destination for testing this package even if the final application uses another bridge. Provision the queue before the bridge. Use the template in `cloudformation/event-bridge-consumer.yaml` with `BridgeKind=sqs`, `Destination=<queue ARN>`, `QueueUrl=<same queue URL>` and the consumer Region's `LatestStreamArn` from `DescribeTable`. The template creates its own private failure archive and alarms; it does not create the destination queue or table.
-
-Bundle `examples/event-bridge-handler.ts` exactly as described in the application-events guide. Upload the ZIP to a private, Region-local artifact bucket with an immutable key. Deploy the mapping and wait until AWS reports `State=Enabled`; do not rely only on the CloudFormation stack completing. Inspect `LastProcessingResult`, `FunctionArn`, `EventSourceArn`, filter criteria, and `FunctionResponseTypes`. Confirm the stream ARN belongs to the intended table in the same Region as the function. `TRIM_HORIZON` can deliver retained pre-existing events, so use an isolated table and idempotent consumers.
-
-The sample SQS IAM policy assumes a standard, same-account queue. A customer-managed KMS key requires its additional permissions; cross-account resources require destination policies. Inspect the failure alarm and S3 destination permissions before the workload.
-
-## Bounded live smoke runner
-
-The runner has an offline plan by default. It makes AWS calls only with `--execute`; it never creates/deletes stacks or tables, purges queues, or removes event items. It publishes three unique facts and attempts same-ID retries/conflicts. Test data stays for diagnosis. Its optional queue check reads a dedicated queue and deletes only messages whose IDs belong to that run; other messages may be temporarily hidden by the receive visibility timeout, so do not use a business queue.
+The runner prints an offline plan unless given `--execute`. It creates no infrastructure, deletes no table data, publishes three uniquely identified facts and exercises same-ID retry/conflict handling. Optional queue observation deletes only messages belonging to that run; unrelated messages can be temporarily hidden by visibility timeout. Evidence is stored in `.event-test-results/` with owner-only permissions.
 
 ```sh
-node scripts/test-events-live.mjs          # offline plan
+node scripts/test-events-live.mjs
 export AWS_PROFILE=your-sandbox-profile
 export EVENT_TEST_TABLE=your-isolated-mrsc-table
 export EVENT_TEST_QUEUE_REGION=us-east-1
@@ -55,31 +31,22 @@ export EVENT_TEST_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/ACCOUNT/TEST_QUE
 npm run test:events:live -- --execute
 ```
 
-The profile needs `dynamodb:DescribeTable`, `dynamodb:PutItem` and `dynamodb:GetItem` on both regional replicas. Queue verification also needs `sqs:ReceiveMessage` and `sqs:DeleteMessage` on the dedicated queue and the optional `@aws-sdk/client-sqs` peer (already installed in this repository). The SDK resolves credentials normally; tokens never belong in command arguments. `EVENT_TEST_QUEUE_URL` may be omitted for a publisher-only test, but **that is not a stream-delivery pass**.
+The profile needs `DescribeTable`, `PutItem` and `GetItem` in both replica Regions, plus `ReceiveMessage` and `DeleteMessage` on the observation queue. The SQS optional peer is required. Credentials use the normal AWS SDK chain. Omitting the queue tests publication only, not delivery.
 
-The runner checks MRSC and stream configuration in both Regions; publishes east/west facts; submits one ID concurrently in both Regions; checks identical committed envelopes and retained timestamps on retry; rejects different content using the same ID; strongly reads all facts from both replicas; and optionally waits up to three minutes for the full envelopes to reach SQS. Nonzero exit means failure. Evidence is saved to `.event-test-results/` (ignored by Git), including test IDs and outcomes, with owner-only permissions. It uses the default `EVENT` partition prefix. The runner intentionally does not verify CloudFront, the app's authenticated HTTP boundary, or business state atomicity.
+The runner verifies MRSC/stream settings, publishes from both Regions, races a shared ID, checks retained timestamps and conflicting content, strongly reads both replicas, and waits up to three minutes for full envelopes in SQS. Nonzero exit indicates failure. Retention later cleans up test events through the normal keyed worker.
 
-## Required failure and replay drills
+## Recovery drills
 
-After a happy-path smoke pass, record these cases in the app's acceptance evidence. Use bounded fault injection only on dedicated test resources.
+Use dedicated resources and bounded fault injection. Record IDs, expected outcomes and CloudWatch evidence.
 
-1. **Producer retry after response loss:** replay the same ID and payload from the opposite Region. The response and original timestamp must match; no extra stream INSERT should appear. A changed payload must fail with `ApplicationEventConflictError`.
-2. **Destination unavailable:** temporarily deny the bridge's send permission or have a controlled webhook return 503. Publish one known ID. Confirm `application_event_delivery_failed`, a delivery-failure alarm, retry attempts, and eventual full batch in S3. Restore the permission/endpoint. A Lambda HTTP 200 with `batchItemFailures` is still a failed delivery.
-3. **Malformed record and later progress:** inject a malformed `APPLICATION_EVENT` only in the isolated table. It must be retried/archived rather than acknowledged. With the sample one-record batch, later good records must resume after the bounded retry policy discards that record.
-4. **Duplicate consumer invocation:** invoke the same saved stream batch twice against a test consumer. An idempotent business consumer must not apply its effect twice. SQS standard queues may contain duplicates; the library does not hide them.
-5. **Consumer Region change:** disable the old mapping and wait for `Disabled`, enable the replacement mapping in the other Region, and repeat publishes. Retained records may replay; require idempotency. This is an operational handoff test, not proof of automatic regional failover or DynamoDB quorum recovery.
-6. **Timeout and archive failure:** use a bounded slow handler to trigger the remaining-time path, then verify retries. Check `IteratorAge`, `Errors`, and `DestinationDeliveryFailures`; a missing archive due to IAM failure is a test failure, not a successful discard.
+1. Lose a producer response, then retry the same ID and content from the other Region. Require the same envelope and timestamp; changed content must fail.
+2. Deny the router's application queue send permission. Require partial stream failure, routing alarm and eventual full batch archive. Restore access and replay an inspected archived batch to the private router.
+3. Deny the application worker's SNS permission. Require application delivery failure logs, retries and the application DLQ while independent workflow messages still progress. Restore access and redrive the inspected messages.
+4. Crash after an outbox publication but before cursor acknowledgement. Retry and verify one event item with the same ID and eventual cursor progress. Repeat concurrent drains in both Regions.
+5. Invoke the same consumer message twice and deliver events out of order. Verify the application's idempotency and domain-version checks.
+6. Exercise a slow handler and unavailable failure archive. Verify timeout guards, `IteratorAge`, queue age and `DestinationDeliveryFailures`; a failed archive write is not successful recovery.
+7. Exercise cleanup after the configured retention boundary and confirm payload deletion, tombstone rejection of late retries, and eventual tombstone expiry.
 
-S3 failure objects contain a `payload` string holding the original Lambda event. Download a specific failure object with the AWS CLI, inspect its IDs, and parse that string to a local JSON batch. After correcting the fault, invoke the same private consumer Lambda with that batch; inspect both the invocation error indicator and `batchItemFailures` before marking it recovered. Preserve the event IDs. **Calling `publish()` again with the same ID does not generate a new stream record**, so it is not a replay mechanism. Replacing the ID invents a second fact and defeats deduplication. Preserve the failure object until verified recovery. The sample archive expires records after 30 days.
+S3 archive objects contain the original Lambda batch in their payload. Inspect a specific object, parse it to a local JSON batch, correct the fault and invoke the private router. Check invocation errors and `batchItemFailures` before considering replay complete. Application queue redrive and stream archive replay are separate recovery operations.
 
-## Limits and completion criteria
-
-Local/emulator tests do not simulate regional quorum, stream propagation, IAM, AWS retries, destination routing, or CloudFront. A pass requires observed delivery through the real mapping and receiver, plus the failure/replay checks above. Report publisher-only, stream-to-SQS, other bridge, and application-end-to-end outcomes separately; do not promote one to another.
-
-For EventBridge, add an actual matching target and assert the full `detail` arrives; a `PutEvents` success alone is insufficient. For SNS, verify a confirmed subscriber receives and unwraps the message. For HTTPS, use a controlled endpoint with request capture, test 2xx/503/timeout and receiver deduplication; never use real notifications in this lab. For FIFO, use a custom `messageGroupId` function and test beyond the service's deduplication window.
-
-No live AWS execution is claimed by this PR. The artifact is ready for controlled integration testing after its local gates pass; production qualification still requires the application's idempotency, ordering, authorization, recovery, retention and capacity design.
-
-## Local verification for this candidate
-
-On 2026-09-27, all 91 tests across 12 suites passed with DynamoDB Local. Strict typecheck, clean build, installed-tarball checks (including optional dependency isolation and Lambda handler typing), all four Lambda example bundles, and `cfn-lint cloudformation/*.yaml` passed. The smoke runner's no-AWS plan path is covered by a test. These results are local evidence, not live AWS outcomes.
+These tests do not establish application transaction atomicity, edge routing correctness or automatic quorum recovery. Validate those in the application's AWS acceptance suite.

@@ -202,6 +202,8 @@ export type WorkflowScheduleSpec =
     }
 
 export interface WorkflowScheduleDefinition {
+  missedTickPolicy?: 'skip' | 'run-once' | 'catch-up'
+  maxCatchUp?: number
   id?: ScheduleId
   schedule: WorkflowScheduleSpec
   overlapPolicy?: WorkflowOverlapPolicy
@@ -210,6 +212,8 @@ export interface WorkflowScheduleDefinition {
 }
 
 export interface UpsertScheduleArgs {
+  missedTickPolicy?: 'skip' | 'run-once' | 'catch-up'
+  maxCatchUp?: number
   scheduleId: ScheduleId
   workflowId: WorkflowId
   workflowVersion?: WorkflowVersion

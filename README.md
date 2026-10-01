@@ -1,57 +1,47 @@
 # tanstack-workflow-aws
 
-An experimental `WorkflowExecutionStore` package for **TanStack Workflow** on AWS. It provides a DynamoDB execution store and a runnable, two-Region Lambda/EventBridge Scheduler/SQS/CloudFront example. It does not use Vercel Workflow.
+An experimental AWS execution store and deployment adapter for the packaged **TanStack Workflow** engine. It supports active/active execution in `us-east-1` and `us-west-2` using a DynamoDB MRSC Global Table with a witness in `us-east-2`.
 
-The package implements the included TanStack Workflow snapshot’s store interface. Import the matching engine from this package’s `/workflow` and `/runtime` entry points; see [snapshot provenance and packaging](docs/packaging.md). Both `us-west-2` and `us-east-1` may accept requests, execute workflows and process targeted wakeups independently. They use their local replica of one **MRSC** DynamoDB Global Table; a witness in `us-east-2` forms the third quorum member. The same run can resume in either application Region.
-
-> **Status:** experimental, prepared for controlled AWS integration testing. Regression tests exercise real DynamoDB expressions against DynamoDB Local, upstream store contracts, interrupted runtime recovery, and the installed package. Live MRSC replication, regional failure injection and load testing remain required before production use. See [review evidence and the AWS test plan](docs/testing.md). No AWS deployment has been performed during this review.
+The package is ready for controlled integration testing. DynamoDB Local tests cannot establish regional quorum behavior, AWS delivery timing, or production capacity. See [testing](docs/testing.md).
 
 ## Architecture
 
-The standalone example runs request handlers and targeted background workers in both application Regions. Each Lambda uses the packaged workflow runtime and DynamoDB store against its local replica of one MRSC Global Table.
+Deploy the following pipeline independently in each application Region. Each replica has exactly one stream mapping. The router only performs durable fan-out; business handlers run behind a separate queue.
 
 ```mermaid
 flowchart TB
-    client["Client"] --> edge["CloudFront and Lambda@Edge routing"]
-    subgraph west["us-west-2"]
-        westApi["HTTP API and request Lambda"] --> westTable[("DynamoDB replica")]
-        westTable -->|"Local stream"| westDispatch["Dispatcher"]
-        westDispatch -->|"Due or near-term key"| westQueue["SQS"]
-        westDispatch -->|"Future deadline"| westSchedule["One-time Scheduler"]
-        westSchedule --> westQueue
-        westQueue --> westWorker["Targeted worker: processTarget"]
-        westWorker -->|"Read, claim and execute named item"| westTable
-        westWorker -->|"Near-term continuation"| westQueue
-        westWorker -->|"Future continuation"| westSchedule
-    end
-    subgraph east["us-east-1"]
-        eastApi["HTTP API and request Lambda"] --> eastTable[("DynamoDB replica")]
-        eastTable -->|"Local stream"| eastDispatch["Dispatcher"]
-        eastDispatch -->|"Due or near-term key"| eastQueue["SQS"]
-        eastDispatch -->|"Future deadline"| eastSchedule["One-time Scheduler"]
-        eastSchedule --> eastQueue
-        eastQueue --> eastWorker["Targeted worker: processTarget"]
-        eastWorker -->|"Read, claim and execute named item"| eastTable
-        eastWorker -->|"Near-term continuation"| eastQueue
-        eastWorker -->|"Future continuation"| eastSchedule
-    end
-    witness["us-east-2 MRSC witness"]
-    edge --> westApi
-    edge --> eastApi
-    westTable <-->|"MRSC replication"| eastTable
-    westTable -.-> witness
-    eastTable -.-> witness
+    api["Request Lambda"] --> table[("MRSC workflow table")]
+    table -->|"One regional stream reader"| router["Stream router"]
+    router -->|"Due work"| work["Workflow SQS"]
+    router -->|"Future deadlines"| timer["One-time Scheduler"]
+    timer --> work
+    work --> worker["Targeted worker"]
+    worker -->|"Claims, checkpoints and effect cursors"| table
+    worker -->|"Unresolved work"| timer
+    worker -->|"Short continuation"| work
+    router -->|"Application events"| events["Application SQS"]
+    events --> consumer["Application consumer"]
+    consumer --> topic["SNS or another destination"]
 ```
 
-Solid arrows show request, invocation and store access paths; dotted links show witness participation in the MRSC quorum, not application access. Both Regions independently wake due work from committed state changes and one-time deadlines, with conditional writes and leases coordinating ownership. Each keyed delivery processes only its named run, timer, or schedule. The worker persists a continuation before acknowledgement when that item still has due work. No permanent minute-based rule is needed. Installing the store alone does not install this wakeup path; deploy the example infrastructure described in [demand-driven wakeups](docs/workflow-wakeups.md). Lambda@Edge provides placement, **not automatic POST failover**. The Global Table is provisioned by one CloudFormation stack, not one per replica. See [the standalone deployment](#standalone-aws-example) and [the existing-app integration guide](docs/tanstack-start-lambda-web-adapter.md).
+The targeted worker handles run recovery, timer delivery, recurring schedule buckets, committed publication intents, and retention. It strongly reads the named item, performs a conditional claim, and persists an unresolved item's successor before acknowledging the queue message. Normal execution does not discover unrelated due work. `DueIndex` supports explicit administrative store/runtime queries; it is not part of the worker's execution path. Cleanup uses bounded queries within a single run partition.
 
-## Install and use
+MRSC conditional writes coordinate execution across regions. A lost quorum stops writes. Queue delivery, stream delivery and external effects remain at least once: downstream handlers must use idempotency keys. Lambda@Edge distributes HTTP traffic but does not provide automatic POST failover.
 
-```sh
-npm install @ataylorme/tanstack-workflow-aws
-```
+## Package entry points
 
-Configure GitHub Packages authentication as described in [the installation guide](docs/packaging.md#github-packages-releases-and-ci). The package is prepared for publication; the example above will resolve after it is published. Until then, use `npm install` from a checkout or a Git reference. The caller needs a table with string `PK`/`SK` keys and `DueIndex` on string `duePK` and number `dueSK` (see `cloudformation/global-table.yaml`).
+| Entry point | Purpose |
+| --- | --- |
+| package root | DynamoDB store, limits, storage version |
+| `/workflow`, `/runtime` | Matching TanStack engine and targeted execution API |
+| `/wakeups` | Injectable stream router, targeted worker and application queue factories |
+| `/aws` | SQS and EventBridge Scheduler transport adapters |
+| `/workflow-effects` | Committed application-event publication and continue-as-new helpers |
+| `/schedules` | Future schedule calculation and missed-tick policy |
+| `/events` | Generic application event publisher |
+| `/bridges/eventbridge`, `/bridges/sns`, `/bridges/sqs`, `/bridges/webhook` | Downstream destination adapters |
+
+Use the matching engine exports; the store and runtime have a shared versioned storage contract. `/aws` requires the optional Scheduler and SQS SDK peers. See [installation and artifacts](docs/packaging.md).
 
 ```ts
 import { randomUUID } from 'node:crypto'
@@ -60,109 +50,59 @@ import { defineWorkflowRuntime } from '@ataylorme/tanstack-workflow-aws/runtime'
 
 const store = createDynamoWorkflowExecutionStore({ tableName: process.env.TABLE_NAME! })
 const runtime = defineWorkflowRuntime({ store, workflows: {
-  example: { load: async () => (await import('./workflow.js')).workflow },
+  task: { load: async () => (await import('./task.js')).workflow },
 } })
-
-// Bind the same owner to the store context and runtime invocation. Use a unique
-// owner per Lambda invocation, including Region and request ID.
 const owner = `${process.env.AWS_REGION}:${randomUUID()}`
-const result = await store.withLeaseOwner(owner, () => runtime.startRun({
-  workflowId: 'example', runId: 'stable-request-id', input: {}, leaseOwner: owner,
-  maxDurationMs: 5_000,
+await store.withLeaseOwner(owner, () => runtime.startRun({
+  workflowId: 'task', runId: 'stable-request-id', input: {},
+  leaseOwner: owner, maxDurationMs: 5_000,
 }))
 ```
 
-Pass `leaseOwner: owner` to `runtime.deliverSignal`, `runtime.deliverApproval`, `runtime.processTarget` and any explicit `runtime.sweep` as well. Keep each call within `withLeaseOwner`. This binds state writes and event commits to the current lease; a resumed worker cannot silently accept a previous worker's write after reclaim. The store can be used directly for inspection without owner context; **do not execute workflows without the context in a multi-worker deployment**. If supplying a custom `DynamoDBDocumentClient`, configure `marshallOptions.removeUndefinedValues: true`.
+Bind the same owner through `withLeaseOwner` for every runtime start, signal, approval, or targeted call. Use stable request/signal IDs across retries, including retries against the other region.
 
-## Design
+## Durable workflow effects
 
-| Resource | Item(s) | Coordination |
-| --- | --- | --- |
-| Run and core `RunState` | `RUN#id / META` | Conditional version replacement, lease owner and expiry |
-| Event log | `RUN#id / SEG#uuid` | Stage immutable batch, then publish `head` and `nextIndex` on run item with one CAS |
-| Timer | Paused run metadata; standalone timer rows for direct store clients | Persisted waits remain discoverable even if timer registration is interrupted |
-| Schedule | `SCHEDULE#id / META`, including its pending bucket | One-item conditional claim preserves unfinished buckets when the next tick advances |
-| Due work | Keyed stream/SQS wakeups; sparse `DueIndex` for legacy sweeps | Targeted claims use strongly consistent base-table reads and conditional writes |
+```ts
+import { createWorkflow } from '@ataylorme/tanstack-workflow-aws/workflow'
+import { publishWorkflowEvent, continueAsNew } from '@ataylorme/tanstack-workflow-aws/workflow-effects'
 
-`appendEvents` stages all events of a batch in one item. A single conditional update to `RUN#id / META` publishes the batch. A reader starts at that pointer and follows `previous` links, so it sees the whole batch or none of it. A failed conditional commit can leave an unreachable segment; it is safe for replay, but requires offline garbage collection. Never delete a staged segment solely because the client timed out: the commit might have succeeded. The event chain is retained after a run is deleted, and `deleteRun` leaves a tombstone to prevent inadvertent ID reuse.
+export const workflow = createWorkflow({ id: 'batch' }).handler(async ctx => {
+  const input = ctx.input as { cursor: number; total: number }
+  const next = await ctx.step('process-batch', step =>
+    processBatch(input.cursor, { idempotencyKey: step.id }))
+  await publishWorkflowEvent(ctx, 'batch-completed', {
+    type: 'batch.completed', data: { cursor: next },
+  })
+  if (next < input.total) return continueAsNew(ctx, { cursor: next, total: input.total })
+  return { complete: true }
+})
+```
 
-This relies on **MRSC** conditional writes and strongly consistent reads. Ordinary MREC Global Tables can accept the same local conditional claim in two Regions and are unsafe for this active/active design. MRSC has no DynamoDB transactions or TTL; explicit retention and orphan cleanup are application responsibilities. The run item also stores delivered signal IDs for atomic deduplication. Large run state, a high number of signal IDs or an event batch above DynamoDB's 400 KB item limit will fail; this prototype does not spill payloads to external storage. Event reads walk the entire chain and administrative `listRuns` uses a table Scan. `DueIndex` currently uses four unsharded partition values (`RUNNING`, `TIMER_RUN`, `TIMER`, `SCHEDULE`), so it needs a shard design and load testing at high throughput.
+`publishWorkflowEvent` commits an intent as a step checkpoint. Only reachable committed log records are published; staged segments are never delivered. A stable event ID makes publication retryable after an acknowledged write whose response was lost. `continueAsNew` must be returned from the handler: the committed terminal event creates one deterministic successor with fresh history. These helpers do not make external business transactions atomic. DSQL applications must use their own transactional outbox for DSQL-originated changes.
 
-Normal keyed wakeups call `runtime.processTarget` for one run, timer, or schedule; they do not query `DueIndex` or discover unrelated work. The worker rereads the named item and persists a keyed continuation before acknowledging unresolved work. `DueIndex` remains eventually consistent and is used only by explicit/legacy sweeps. Duplicate deliveries are harmless to claims, but **external side effects still require idempotency keys** because a worker can die after a side effect and before its completion event commits. Keep clock skew below the lease margin; use a lease longer than the maximum expected store write and heartbeat interval. A lost MRSC quorum prevents writes; no store can continue safely in a single isolated Region under this consistency model.
+## Schedules and lifecycle
 
-Queued runs and expired or released running leases are targeted recovery candidates (and remain discoverable by explicit sweeps). Accepted signals and approvals persist their payload with the deduplication ID; recovery publishes the resolution event and clears that payload atomically. Schedule policies `allow` and `skip` are supported; `buffer-one`, `cancel-previous` and `terminate-previous` are rejected. Schedule metadata changed during this pre-release review: use a fresh test table rather than mixing old prototype workers or records with this implementation.
+Register cron/interval definitions once using `materializeWorkflowSchedules`. Workers atomically advance the next tick after consuming a bucket. Policies `skip`, `run-once` and bounded `catch-up` determine behavior after missed ticks; `allow` and `skip` control overlap. Generation-qualified bucket IDs isolate definition edits. See [scheduling and retention](docs/lifecycle.md).
 
-## Framework-independent package
+Default per-run limits are 256 history events, 1 MiB serialized history, 300 KiB serialized items, and 1,000 accepted signal/approval IDs. Continue as new before reaching a limit. Terminal histories and application payloads are retained for seven days, followed by compact tombstones for thirty days. Cleanup never removes a run with undelivered effects. Retention is explicit because MRSC has no TTL. Large payloads should be stored externally and referenced by immutable IDs.
 
-The library implements TanStack Workflow's store contract for a Node.js runtime. It has no dependency on TanStack Start, Lambda Web Adapter, an application's database, or an HTTP routing framework. Applications supply their workflow definitions and may use any business datastore. The Lambda handlers and CloudFormation templates are optional deployment examples; separate regional targeted worker Lambdas can share any application's workflow registry.
+## Deploy and test
 
-## TanStack Start with Lambda Web Adapter and Aurora DSQL
+1. Deploy `cloudformation/global-table.yaml` once and wait for both replicas to become active.
+2. Build the four thin Lambda handlers and deploy `cloudformation/workers.yaml` in each application Region with its local stream ARN.
+3. Deploy `cloudformation/regional.yaml` for the optional standalone HTTP API, then `cloudformation/edge.yaml` for its routing layer. Add application authentication before exposing the API.
+4. Seed schedule definitions from a deployment/configuration task.
 
-For an existing Start application in `us-east-1` and `us-west-2`, use this package in server functions/routes alongside your DSQL client. DSQL remains the application database; DynamoDB MRSC holds workflow coordination and history. The recommended deployment adds a stream dispatcher, one-time EventBridge Scheduler schedules, and an SQS-backed targeted worker Lambda in each application Region, sharing the same workflow definitions as the web application. Reuse the application's existing CloudFront/Lambda@Edge ingress.
-
-See [the integration guide](docs/tanstack-start-lambda-web-adapter.md) for request ownership, bounded execution, the DSQL outbox boundary, and the dedicated [worker template](cloudformation/sweeper.yaml). These integration files do not provision or modify DSQL clusters or your Start application.
-
-## Standalone AWS example
-
-Deploy the table once, then the API and demand-driven wakeup stacks in each application Region, and finally the edge stack. These are real, billable resources; inspect public API, IAM, retention and monitoring settings first.
-
-1. Deploy `cloudformation/global-table.yaml` **once**, from `us-west-2`, and wait for both replicas to become ACTIVE:
-
-   ```sh
-   export AWS_PROFILE=YOUR_SANDBOX_PROFILE
-   export TABLE_NAME=YOUR_WORKFLOW_TABLE
-   export TABLE_STACK=YOUR_TABLE_STACK
-   aws cloudformation deploy --region us-west-2 --stack-name "$TABLE_STACK" \
-     --template-file cloudformation/global-table.yaml \
-     --parameter-overrides "TableName=$TABLE_NAME"
-   ```
-
-   See [MRSC provisioning and safe rollback recovery](docs/mrsc-deployment.md) before retrying a partial deployment. Do not delete an existing table.
-2. Build and upload the combined `handler.js`, `sweeper.js`, and `dispatcher.js` ZIP using the commands in [the wakeup deployment guide](docs/workflow-wakeups.md#build-and-deploy). Keep the same `TABLE_NAME`, use a new immutable S3 key for each build, and use a bucket local to each Region.
-3. Deploy `cloudformation/regional.yaml` in **each** application Region with `TableName`, local `CodeBucket`, immutable `CodeKey`, `LegacyScheduleMode=removed`, and `--capabilities CAPABILITY_IAM`. This is the standalone HTTP API; fresh stacks have no integrated periodic sweeper.
-4. Deploy `cloudformation/sweeper.yaml` in **each** application Region using the same ZIP and its regional table `StreamArn`, following [the complete commands](docs/workflow-wakeups.md#build-and-deploy). This separate stack is required for background recovery and durable timers, including when using the standalone API.
-5. Deploy `cloudformation/edge.yaml` **only in `us-east-1`** with `WestApiDomain` and `EastApiDomain` from the API stacks and `--capabilities CAPABILITY_IAM`. CloudFront uses a versioned Lambda@Edge function to hash `x-workflow-run-id` (or URL path) across the APIs.
-
-For an existing deployment, **do not remove its recurring rule before enabling and reconciling the replacement**. Follow [migration and rollback](docs/workflow-wakeups.md#migrate-existing-polling-stacks).
-
-The example accepts `POST /runs` with required `x-workflow-run-id` and JSON input, and `POST /runs/{id}/signals` with JSON `{ "signalId": "stable-id", "message": "done" }`. The workflow pauses for the `complete` signal and may resume in either Region. Invoke the CloudFront `Endpoint` output. Supply stable run and signal IDs on retries. The example does not configure an API authorizer; add authentication, access controls, alarms and throttling before exposing it to untrusted users.
-
-CloudFront native origin-group failover covers GET/HEAD/OPTIONS only. The included Lambda@Edge router gives active/active placement, **not automatic failover for POST**. A regional outage requires an external health-based routing mechanism or a client retry against the other regional `ApiUrl` with the same idempotency key. Because every region uses the same MRSC store, such a retry can resume safely when quorum is available. Lambda@Edge only routes HTTP; it does not run the scheduler.
-
-## Development
+Follow [deployment and operations](docs/workflow-wakeups.md), [TanStack Start integration](docs/tanstack-start-lambda-web-adapter.md), and [application events](docs/application-events.md).
 
 ```sh
 npm ci
 npm run typecheck
 npm run build
-npm test
-npm run test:package
 DYNAMODB_LOCAL_JAR=/path/to/DynamoDBLocal.jar npm run test:integration
+npm run test:package
 cfn-lint cloudformation/*.yaml
 ```
 
-`npm test` runs unit checks and skips emulator suites unless `DYNAMODB_ENDPOINT` is configured. `test:integration` starts DynamoDB Local when given its JAR and runs all suites. Download DynamoDB Local from [AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html); Java 17 or later is required. Tests create and delete isolated tables and accept only localhost endpoints. They are not a live AWS test runner. See [the testing guide](docs/testing.md) for reproducible checks and the separate MRSC test plan.
-
-
-## Application events with DynamoDB Streams
-
-The package also exposes a generic application-event publisher at `@ataylorme/tanstack-workflow-aws/events`. Application events are deliberately separate from TanStack Workflow's internal replay log and can represent any domain fact.
-
-```ts
-import { createDynamoApplicationEventPublisher } from '@ataylorme/tanstack-workflow-aws/events'
-
-const events = createDynamoApplicationEventPublisher({
-  tableName: process.env.TABLE_NAME!,
-})
-
-await events.publish({
-  type: 'task.requested',
-  data: { taskId: 'task-123', requestedBy: 'user-456' },
-})
-```
-
-The shared MRSC table enables DynamoDB Streams with `NEW_IMAGE`, so applications can attach independent Lambda consumers for notifications, database projections, audit history, analytics, or workflow triggers without requiring EventBridge. Producers can supply a stable event `id` for idempotent retries; consumers must also be idempotent because stream delivery is at least once.
-
-See [the application events guide](docs/application-events.md) for optional EventBridge, SNS, SQS, and HTTPS webhook bridges, independent stream consumer examples, and a deployable CloudFormation bridge template.
-
-For the prerelease artifact, deployment prerequisites and bounded AWS checks, see [event testing](docs/event-testing.md).
+The optional templates provision billable AWS resources. No deployment is performed by installation or by the local test commands.

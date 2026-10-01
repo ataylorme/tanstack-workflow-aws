@@ -1,89 +1,75 @@
-# Application events with DynamoDB Streams
+# Application events and committed workflow effects
 
-The application event API is generic and independent of TanStack Workflow's internal replay log. It stores immutable domain facts in DynamoDB. DynamoDB Streams triggers consumers; EventBridge is optional. The API is not a transactional outbox or a durable consumer registry. Application-event bridges remain stream-triggered and separate from [workflow deadline wakeups](workflow-wakeups.md). Publishing an application event does not itself schedule a workflow: an application consumer must durably start or signal that workflow; its resulting workflow metadata drives the wakeup dispatcher.
+The unified DynamoDB Stream router durably fans out immutable application facts to the application queue. Its private application worker publishes to the regional SNS topic. Independent consumers subscribe through their own queues and deduplicate by event ID. Workflow execution and application delivery have separate concurrency, retry and dead-letter queues. Deploy exactly one router mapping per replica; downstream consumers do not attach to that stream.
 
-## Publish and retry
+```mermaid
+flowchart TD
+  Log["Committed workflow checkpoint"] --> Outbox["Targeted outbox worker"]
+  Producer["Application producer"] --> Events["DynamoDB event item"]
+  Outbox --> Events
+  Events --> Router["Unified stream router"]
+  Router --> Queue["Application queue"]
+  Queue --> Worker["Application worker"]
+  Worker --> Topic["SNS topic"]
+  Topic --> Notifications["Notification queue"]
+  Topic --> Projections["Projection queue"]
+```
+
+## Publish
 
 ```ts
 import { createDynamoApplicationEventPublisher } from '@ataylorme/tanstack-workflow-aws/events'
-
 const events = createDynamoApplicationEventPublisher({ tableName: process.env.TABLE_NAME! })
-await events.publish<{ taskId: string; requestedBy: string }>({
-  id: 'task-123:requested',
-  type: 'task.requested',
-  data: { taskId: 'task-123', requestedBy: 'user-456' },
+await events.publish({ id: 'task-123:requested', type: 'task.requested',
+  data: { taskId: 'task-123', requestedBy: 'user-456' } })
+```
+
+Supply a stable ID for retries. An omitted ID generates a UUID. The publisher conditionally creates `EVENT#<id>/META`. On duplicates or ambiguous write responses, it strongly reads that item: identical content returns the original envelope; different content throws `ApplicationEventConflictError`. An omitted timestamp preserves the original timestamp during reconciliation. An explicitly supplied timestamp must match. Writers need both `PutItem` and `GetItem`.
+
+The envelope contains `id`, `type`, positive integer `version` (default 1), ISO `timestamp`, JSON `data`, and optional `correlationId`, `causationId` and string-valued `metadata`. IDs are bounded to 256 characters, types to 100, nesting to 24, and serialized envelopes to 240 KiB. Convert dates and other non-JSON values deliberately; store large payloads externally. Validation rejects undefined, bigint, unsafe/nonfinite numbers, cycles and class instances before writing.
+
+Inside a workflow, use the committed-log helper:
+
+```ts
+import { publishWorkflowEvent } from '@ataylorme/tanstack-workflow-aws/workflow-effects'
+await publishWorkflowEvent(ctx, 'task-requested', {
+  type: 'task.requested', data: { taskId: ctx.input.taskId },
 })
 ```
 
-An omitted ID generates a UUID; **supply the same stable ID on retries**. The publisher conditionally creates `PK = EVENT#<id>`, `SK = META`. On a duplicate or ambiguous write response, it strongly reads that item: identical content returns the original envelope; different content throws `ApplicationEventConflictError`. If the caller omits `timestamp`, reconciliation preserves the timestamp already stored. An explicitly supplied timestamp must match. Reads require `dynamodb:GetItem` as well as the writer's `dynamodb:PutItem`. Transient MRSC write conflicts are retried with a bounded backoff; unresolved infrastructure errors still reject. Retrying without a stable ID can produce a second event.
+The helper checkpoints an intent with a deterministic step-derived ID. The log head and pending outbox boundary commit atomically on the run item. The targeted worker publishes only committed intents and acknowledges its cursor after durable publication. A failed or ambiguous acknowledgement safely retries the same ID. Staged, unreachable log segments never publish. An event describes its checkpoint, not successful completion of subsequent steps.
 
-The JSON envelope contains `id`, `type`, positive integer `version` (default 1), ISO timestamp, generic `data`, optional `correlationId`, `causationId`, and a string `metadata` map. Data must be portable JSON: no `undefined`, bigint, non-finite/unsafe integer numbers, cycles, class instances, dates, sets, or maps. Convert those deliberately before publishing. IDs/correlation fields are bounded to 256 characters, types to 100, nesting to 24, and the serialized envelope to 240 KiB. This leaves space for DynamoDB and bridge wrappers. Store larger payloads externally and publish their location. Validation happens before writing.
+Application database mutations and direct publication are separate operations. Producers needing atomic state-to-event handoff must implement an outbox in their authoritative database. The workflow helper provides that handoff for workflow checkpoints, not arbitrary application writes. See [lifecycle](lifecycle.md) for retention and bounded draining.
 
-Application state updates and event publication are separate operations. A successful state update followed by a failed publish needs application recovery or an outbox in the authoritative store. MRSC tables do not support DynamoDB transaction APIs; do not assume a multi-item transaction can make this atomic.
-
-## Consume stream records
+## Consume and bridge
 
 ```ts
-import type { DynamoDBStreamHandler } from 'aws-lambda'
-import { createApplicationStreamHandler } from '@ataylorme/tanstack-workflow-aws/event-stream'
-
-export const handler: DynamoDBStreamHandler = createApplicationStreamHandler(
-  async event => { /* validate event.data for your domain; apply an idempotent effect */ },
-  { minRemainingTimeMs: 15_000 },
-)
-```
-
-The adapter accepts Lambda's stream event type, ignores non-INSERT and unrelated items, validates application envelopes, processes a batch sequentially, and stops at the first failure. It returns the failing **sequence number** in `batchItemFailures`. Enable `ReportBatchItemFailures` on the event source mapping. If no usable sequence exists, it throws to retry the entire batch. It logs a stable `application_event_delivery_failed` marker plus IDs and error name, without payloads. An optional `onError` hook can add application diagnostics. A remaining-time guard avoids starting another record near timeout; each handler must also bound its own I/O. It cannot interrupt an already-running handler.
-
-Delivery is at least once. Retried batches, duplicate stream delivery, regional failover, and an acknowledged external effect followed by a crash can all repeat side effects. Every destination needs idempotency using the application event ID. A conditional receipt written *before* a nontransactional side effect can lose delivery after a crash; writing it *after* can repeat that effect. This package does not claim exactly-once delivery.
-
-There is no global business-event ordering: separate event IDs are separate DynamoDB items and can use different shards. Do not assume `task.requested` will be delivered before `task.completed`. Use domain versions or sequence numbers where order matters. FIFO bridges preserve arrival order to their destination, not an order that the source never supplied.
-
-## Optional bridges
-
-| Subpath | Factory | Optional SDK client | Transport envelope |
-| --- | --- | --- | --- |
-| `bridges/eventbridge` | `createEventBridgeBridge` | `@aws-sdk/client-eventbridge` | Full event in `detail`; `detail-type` is `<type>.v<version>` |
-| `bridges/sns` | `createSnsBridge` | `@aws-sdk/client-sns` | Full event JSON in SNS `Message` |
-| `bridges/sqs` | `createSqsBridge` | `@aws-sdk/client-sqs` | Full event JSON in SQS `MessageBody` |
-| `bridges/webhook` | `createWebhookBridge` | None (Node fetch) | Full event JSON in HTTPS POST body |
-
-Install only the AWS clients used by your own handler. Core, events, stream, and webhook imports work without them. The configurable example imports all adapters, so building that entire example requires all three clients, included in this repository's dev dependencies. A custom SQS-only handler needs only the SQS peer:
-
-```ts
+import { createApplicationQueueHandler } from '@ataylorme/tanstack-workflow-aws/wakeups'
 import { createSqsBridge } from '@ataylorme/tanstack-workflow-aws/bridges/sqs'
-import { createApplicationStreamHandler } from '@ataylorme/tanstack-workflow-aws/event-stream'
-export const handler = createApplicationStreamHandler(
-  createSqsBridge({ queueUrl: process.env.QUEUE_URL! }),
-  { minRemainingTimeMs: 15_000 },
+export const handler = createApplicationQueueHandler(
+  createSqsBridge({ queueUrl: process.env.DESTINATION_QUEUE_URL! }),
 )
 ```
 
-Each AWS bridge accepts its own SDK client for explicit Region, retry and request-timeout configuration. Configure bounded SDK request timeouts within your Lambda budget. The EventBridge bridge checks individual entry failures, even on HTTP success. A nonexistent event bus can still silently discard events, so provision the bus and verify an actual receiving target. SNS subscribers normally receive SNS's outer envelope unless raw delivery is configured; `eventType` is also supplied as a message attribute for SNS/SQS.
+Queue handlers validate envelopes, isolate per-message failures and return SQS message IDs in `batchItemFailures`. Enable `ReportBatchItemFailures`. A remaining-time guard avoids starting work near timeout; handlers must bound their own I/O. Failure logs use `application_event_delivery_failed` without payloads. The standard deployment uses [application-consumer.ts](../examples/application-consumer.ts); [event-bridge-handler.ts](../examples/event-bridge-handler.ts) demonstrates configurable downstream bridges.
 
-FIFO SNS/SQS destinations require a `messageGroupId` function. The adapter hashes `event.id` with SHA-256 for a stable, bounded `MessageDeduplicationId`; the original ID remains in the payload. Choose valid group IDs and retain downstream deduplication beyond AWS's finite FIFO deduplication window. The stock configurable Lambda and template target standard SNS/SQS; supply a custom handler for FIFO.
+| Subpath | Factory | Optional SDK peer | Destination body |
+| --- | --- | --- | --- |
+| `bridges/eventbridge` | `createEventBridgeBridge` | `@aws-sdk/client-eventbridge` | Full event in `detail`; detail-type is `<type>.v<version>` |
+| `bridges/sns` | `createSnsBridge` | `@aws-sdk/client-sns` | Event JSON in `Message` |
+| `bridges/sqs` | `createSqsBridge` | `@aws-sdk/client-sqs` | Event JSON in `MessageBody` |
+| `bridges/webhook` | `createWebhookBridge` | None | Event JSON in HTTPS POST body |
 
-Webhooks require HTTPS, reject credentials in URLs and redirects, default to a ten-second timeout, and throw on non-2xx or network failures. `x-event-id` contains `encodeURIComponent(event.id)`; decode it if using the header as an idempotency key. Use the JSON `id` unchanged for all other consumers. Inject authentication through `headers` using your secret management process. Responses are cancelled after reading their status to free connections without buffering arbitrary bodies. Authentication, signatures, rate limiting and receiver-side idempotency are application responsibilities.
+Each AWS bridge accepts an injected client. Set Region, retry counts and request timeouts within the Lambda budget. EventBridge checks individual entry failures; provision the bus and verify an actual receiving target. SNS subscriptions receiving these events through `createApplicationQueueHandler` must enable raw message delivery so each queue body is the event envelope. Give each independent consumer its own subscription queue.
 
-## Deploy and operate
+FIFO destinations require a `messageGroupId` function. Bridges hash the event ID for the deduplication ID, but destination idempotency must last beyond the finite FIFO deduplication window. FIFO preserves arrival order, not global business ordering. Separate event items can reach different stream shards; consumers must handle out-of-order domain versions.
 
-The [bridge Lambda](../examples/event-bridge-handler.ts) selects one target via `BRIDGE_KIND`. The [CloudFormation template](../cloudformation/event-bridge-consumer.yaml) provides IAM, an INSERT/application-item filter, partial batch reporting, one-record batches, bounded retries, retained logs, delivery-failure/iterator-age/runtime-error alarms, and a private S3 failure archive with 30-day expiration. Attach notification actions to the alarms for your deployment. The archive preserves the full original batch, unlike an SQS/SNS failure destination that only retains metadata.
+Webhooks require HTTPS, reject URL credentials and redirects, default to a ten-second timeout, and reject non-2xx responses. `x-event-id` is the URI-encoded event ID. Inject authorization headers through your secret management process. Receiver-side authentication and idempotency remain application responsibilities.
 
-Supply the Region-local `StreamArn`, regional code bucket, immutable ZIP key, `BridgeKind`, and `Destination` (event bus/topic/queue ARN or HTTPS URL). SQS also needs `QueueUrl`; EventBridge has an `EventSource` parameter. Match the ARN and queue URL, use same-account regional resources for the example, and provision the selected target first. KMS-encrypted targets or cross-account targets need additional policies outside this minimal example.
+## Operate
 
-Bundle from this repository:
+Deploy [workers.yaml](../cloudformation/workers.yaml) using [the wakeup guide](workflow-wakeups.md). The router acknowledges records only after durable fanout and scheduling. Exhausted stream batches go to a private S3 archive. Failed application messages go to the application DLQ; they do not block workflow execution. Monitor router lag/failures, archive delivery, application queue age and consumer failures. Attach notification actions to alarms.
 
-```sh
-npm ci
-npx --no-install esbuild examples/event-bridge-handler.ts --bundle --platform=node \
-  --target=node22 --format=cjs --outfile=build/bridge/handler.js
-(cd build/bridge && zip -X bridge.zip handler.js)
-```
+Delivery is at least once. Both regional routers can see the same event. Use a globally coordinated receipt or an idempotent destination for the same logical effect across Regions; a receipt written before a nontransactional effect can lose it, while a receipt written afterward can repeat it. The package does not claim exactly-once delivery.
 
-The mapping uses `TRIM_HORIZON` to avoid missing records during eventual mapping creation. It can replay retained records; enforce idempotency. DynamoDB Streams retains records for 24 hours; older table items are not automatically replayed. The example sends exhausted/over-age batches to S3 after at most five retries or one hour of record age, so that archive is part of recovery, not a guarantee of successful final delivery. Monitor archive write failures (`DestinationDeliveryFailures`) as well as the included alarms. Confirm the mapping is `Enabled` before beginning acceptance tests.
-
-For global tables AWS recommends one simultaneous stream reader per shard. Do not deploy all four example bridges plus multiple application consumers onto the same replica stream. Choose one reader and fan out through SNS or another application-owned delivery mechanism if many independent consumers are needed. MRSC replicas contain the same stream changes, so deploying the same logical consumer in both Regions can duplicate every side effect. Start with one chosen consumer Region for testing. Regional consumer failover requires controlled mapping activation and destination deduplication; producers may remain active in both Regions.
-
-See [live AWS event testing](event-testing.md) for artifact pinning, the bounded smoke runner, fault/replay checks, and the application integration contract. [Publishing examples](../examples/application-events.ts) illustrate task facts; [consumer stubs](../examples/event-consumer.ts) illustrate routing and must be connected to real services with idempotency.
-
-References: [MRSC behavior](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html), [Lambda stream processing](https://docs.aws.amazon.com/lambda/latest/dg/with-ddb.html), and [failure destinations](https://docs.aws.amazon.com/lambda/latest/dg/services-dynamodb-errors.html).
+Streams retain records for 24 hours. Table retention does not automatically replay historical events; use inspected archive replay or an application-owned event replay operation within your retention window. Tombstones prevent ID reuse until expiry. See [AWS acceptance testing](event-testing.md).

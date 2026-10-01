@@ -40,6 +40,22 @@
     "./bridges/webhook": {
       "types": "./dist/bridges-webhook.d.ts",
       "import": "./dist/bridges-webhook.js"
+    },
+    "./wakeups": {
+      "types": "./dist/wakeups.d.ts",
+      "import": "./dist/wakeups.js"
+    },
+    "./aws": {
+      "types": "./dist/aws.d.ts",
+      "import": "./dist/aws.js"
+    },
+    "./workflow-effects": {
+      "types": "./dist/workflow-effects.d.ts",
+      "import": "./dist/workflow-effects.js"
+    },
+    "./schedules": {
+      "types": "./dist/schedules.d.ts",
+      "import": "./dist/schedules.js"
     }
   },
   "files": [
@@ -67,7 +83,8 @@
     "@aws-sdk/lib-dynamodb": "^3.900.0",
     "@aws-sdk/util-dynamodb": "^3.996.9",
     "@opentelemetry/api": "^1.9.0",
-    "@standard-schema/spec": "^1.1.0"
+    "@standard-schema/spec": "^1.1.0",
+    "cron-parser": "5.10.1"
   },
   "devDependencies": {
     "@aws-sdk/client-eventbridge": "^3.1141.0",
@@ -93,7 +110,8 @@
   "peerDependencies": {
     "@aws-sdk/client-eventbridge": "^3.1141.0",
     "@aws-sdk/client-sns": "^3.1141.0",
-    "@aws-sdk/client-sqs": "^3.1141.0"
+    "@aws-sdk/client-sqs": "^3.1141.0",
+    "@aws-sdk/client-scheduler": "^3.1136.0"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/client-eventbridge": {
@@ -103,6 +121,9 @@
       "optional": true
     },
     "@aws-sdk/client-sqs": {
+      "optional": true
+    },
+    "@aws-sdk/client-scheduler": {
       "optional": true
     }
   }

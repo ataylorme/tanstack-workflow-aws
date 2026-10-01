@@ -1,3 +1,6 @@
+import { nextScheduleTime, advanceSchedule } from './schedules.js'
+import { committedEffect } from './workflow-effects.js'
+import type { ApplicationEventPublisher } from './events.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
@@ -14,7 +17,18 @@ import type {
   RunSummary, UpsertScheduleArgs, ScheduleTimerArgs, ClaimTargetArgs,
 } from './runtime.js'
 
+export const STORAGE_VERSION = 1
+export interface WorkflowLimits {
+  maxHistoryEvents: number
+  maxHistoryBytes: number
+  maxItemBytes: number
+  maxSignalIds: number
+  terminalRetentionMs: number
+  tombstoneRetentionMs: number
+}
+export class WorkflowLimitError extends Error { override name = 'WorkflowLimitError' }
 export interface DynamoWorkflowStoreOptions {
+  limits?: Partial<WorkflowLimits>
   /** An MRSC Global Table with PK/SK, and DueIndex (duePK/dueSK). */
   tableName: string
   client?: DynamoDBDocumentClient
@@ -23,6 +37,8 @@ export interface DynamoWorkflowStoreOptions {
 /** Bind every runtime call to the lease owner passed to startRun/processTarget/sweep. Required for fencing state/event writes. */
 export type FencedWorkflowExecutionStore = WorkflowExecutionStore & Required<Pick<WorkflowExecutionStore,
   'claimStaleRun' | 'claimTimer' | 'claimScheduleBucket'>> & {
+  drainEffects(runId: string, publisher: ApplicationEventPublisher, limit?: number, deadline?: number): Promise<number>
+  cleanupItem(PK: string, now?: number, limit?: number, deadline?: number): Promise<void>
   withLeaseOwner<T>(owner: string, run: () => Promise<T>): Promise<T>
 }
 
@@ -40,12 +56,25 @@ const scheduleKey = (id: string) => `SCHEDULE#${id}`
 const expressionNames = { '#v': 'version' }
 
 export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreOptions): FencedWorkflowExecutionStore {
-  const client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } })
+  const client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 3, requestHandler: { connectionTimeout: 1000, requestTimeout: 4000, throwOnRequestTimeout: true } }), { marshallOptions: { removeUndefinedValues: true } })
+  const limits: WorkflowLimits = { maxHistoryEvents: 256, maxHistoryBytes: 1024 * 1024,
+    maxItemBytes: 300 * 1024, maxSignalIds: 1000, terminalRetentionMs: 7 * 86400_000,
+    tombstoneRetentionMs: 30 * 86400_000, ...options.limits }
+  for (const [name, value] of Object.entries(limits)) if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`Invalid limit: ${name}`)
+  if (limits.maxItemBytes > 350 * 1024) throw new TypeError('maxItemBytes must leave DynamoDB metadata headroom')
+  const checkSize = (item: unknown) => {
+    if (Buffer.byteLength(JSON.stringify(item)) > limits.maxItemBytes) throw new WorkflowLimitError('Item size budget exceeded; use an external payload reference')
+  }
   const TableName = options.tableName
   if (!TableName) throw new Error('tableName is required')
   const key = (PK: string, SK = 'META') => ({ PK, SK })
-  const get = async (PK: string, SK = 'META') => (await client.send(new GetCommand({ TableName, Key: key(PK, SK), ConsistentRead: true }))).Item as Item | undefined
+  const get = async (PK: string, SK = 'META') => {
+    const item = (await client.send(new GetCommand({ TableName, Key: key(PK, SK), ConsistentRead: true }))).Item as Item | undefined
+    if (item && item.schemaVersion !== STORAGE_VERSION) throw new Error('Unsupported workflow storage version')
+    return item
+  }
   const put = async (item: Item, condition = 'attribute_not_exists(PK)') => {
+    item = { ...item, schemaVersion: STORAGE_VERSION }; checkSize(item)
     for (let attempt = 0; ; attempt++) {
       try { return await client.send(new PutCommand({ TableName, Item: item, ConditionExpression: condition })) }
       catch (error) { if (!isReplicationConflict(error) || attempt >= 7) throw error; await backoff(attempt) }
@@ -84,7 +113,9 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
       ? event.type === 'SIGNAL_RESOLVED' && event.signalId === pending.delivery.signalId && event.name === pending.delivery.name
       : event.type === 'APPROVAL_RESOLVED' && event.approvalId === pending.approval.approvalId)
   async function replace(current: Item, changes: Item): Promise<Item> {
-    const next = { ...current, ...changes, version: current.version + 1 }
+    const next: Item = { ...current, ...changes, schemaVersion: STORAGE_VERSION, version: current.version + 1 }
+    if (next.run && terminal(next.run.status) && next.cleanupAt === undefined) next.cleanupAt = Date.now() + limits.terminalRetentionMs
+    checkSize(next)
     // PutItem replaces the entire item with a version guard; no two readers can silently overwrite each other.
     await client.send(new PutCommand({ TableName, Item: next, ConditionExpression: '#v = :v', ExpressionAttributeNames: expressionNames, ExpressionAttributeValues: { ':v': current.version } }))
     return next
@@ -119,9 +150,9 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
     return found
   }
   const stored = (runId: string, start: number, events: readonly WorkflowEvent[]): StoredWorkflowEvent[] => events.map((event, i) => ({ runId, eventIndex: start + i, eventType: event.type, stepId: 'stepId' in event ? event.stepId : undefined, event, createdAt: event.ts }))
-  async function readEvents(args: ReadEventsArgs): Promise<readonly StoredWorkflowEvent[]> {
+  async function readEvents(args: ReadEventsArgs, includeDeleted = false): Promise<readonly StoredWorkflowEvent[]> {
     const meta = await get(runKey(args.runId))
-    if (!meta || meta.deleted) return []
+    if (!meta || (meta.deleted && !includeDeleted)) return []
     const parts: StoredWorkflowEvent[][] = []
     let pointer: string | undefined = meta.head
     let expected = meta.nextIndex as number
@@ -143,6 +174,7 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
       const run = runOf(current)
       if ((current.deliveredIds ?? []).includes(id)) return { kind: 'duplicate', run }
       if (!waiting(run)) return { kind: 'not-waiting', run }
+      if ((current.deliveredIds?.length ?? 0) >= limits.maxSignalIds) throw new WorkflowLimitError('Signal deduplication budget exceeded; continue as new')
       const next: WorkflowExecution = { ...run, status: 'queued', awaiting: undefined, waitingFor: undefined, pendingApproval: undefined, wakeAt: undefined, updatedAt: now }
       try {
         const result = await replace(current, { run: next, pending, deliveredIds: [...(current.deliveredIds ?? []), id], ...dueFields(next) })
@@ -186,19 +218,25 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
     }
     if (!schedule.enabled || typeof schedule.nextFireAt !== 'number' || !Number.isFinite(schedule.nextFireAt) || schedule.nextFireAt > args.now ||
         (schedule.lastStartedAt !== undefined && schedule.nextFireAt <= schedule.lastStartedAt)) return undefined
+    if (schedule.missedTickPolicy === 'skip' && nextScheduleTime(schedule.spec, schedule.nextFireAt) <= args.now) {
+      const advanced = { nextFireAt: nextScheduleTime(schedule.spec, args.now), catchUpRemaining: undefined }
+      try { await replace(schedule, { ...advanced, ...scheduleDueFields({ ...schedule, ...advanced }) }) }
+      catch (error) { if (!isConflict(error)) throw error }
+      return undefined
+    }
     if (!['skip', 'allow'].includes(schedule.overlapPolicy)) throw new Error(`Unsupported schedule overlap policy: ${schedule.overlapPolicy}`)
     if (schedule.overlapPolicy === 'skip' && schedule.activeRunId) {
       const active = await store.loadRun(schedule.activeRunId)
       if (active && !terminal(active.status)) {
         // Consume this tick atomically. A concurrent schedule update forces fresh evaluation.
-        const next = { ...schedule, lastStartedAt: schedule.nextFireAt }
-        try { await replace(schedule, { lastStartedAt: next.lastStartedAt, ...scheduleDueFields(next) }) }
+        const next = { ...schedule, lastStartedAt: schedule.nextFireAt, ...advanceSchedule(schedule, schedule.nextFireAt, args.now) }
+        try { await replace(schedule, { lastStartedAt: next.lastStartedAt, nextFireAt: next.nextFireAt, catchUpRemaining: next.catchUpRemaining, ...scheduleDueFields(next) }) }
         catch (error) { if (!isConflict(error)) throw error }
         return undefined
       }
     }
-    const bucketId = String(schedule.nextFireAt)
-    const bucket = { scheduleId: schedule.scheduleId, bucketId, workflowId: schedule.workflowId, workflowVersion: schedule.workflowVersion,
+    const bucketId = `${schedule.generation}:${schedule.nextFireAt}`
+    const bucket = { generation: schedule.generation, scheduleId: schedule.scheduleId, bucketId, workflowId: schedule.workflowId, workflowVersion: schedule.workflowVersion,
       runId: `${schedule.workflowId}:${schedule.scheduleId}:${bucketId}`, fireAt: schedule.nextFireAt, input: schedule.input,
       overlapPolicy: schedule.overlapPolicy, lease: lease(args.leaseOwner, args.leaseMs, args.now) }
     try {
@@ -228,6 +266,69 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
     return { run: next, lease: next.lease }
   }
   const store: FencedWorkflowExecutionStore = {
+    async drainEffects(runId, publisher, limit = 10, deadline = Infinity) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('Invalid effect batch limit')
+      const meta = await get(runKey(runId))
+      if (!meta || meta.purging || meta.purgedAt !== undefined || (meta.outboxEnd ?? 0) <= (meta.outboxCursor ?? 0)) return 0
+      const events = await readEvents({ runId, fromIndex: meta.outboxCursor ?? 0 }, true)
+      let processed = 0
+      let cursor = meta.outboxCursor ?? 0
+      let acknowledged = cursor
+      for (const entry of events) {
+        if (entry.eventIndex >= meta.outboxEnd || processed >= limit || Date.now() + 10_000 >= deadline) break
+        const effect = committedEffect(entry.event)
+        if (effect?.$workflowEffect === 'publish') await publisher.publish(effect.event)
+        else if (effect?.$workflowEffect === 'continue') await store.createRun({ runId: effect.runId,
+          workflowId: meta.run.workflowId, workflowVersion: meta.run.workflowVersion, input: effect.input, now: Date.now() })
+        cursor = entry.eventIndex + 1
+        if (!effect) continue
+        processed++
+        // Acknowledge only after the idempotent effect. Cursor and append metadata share a version guard.
+        await mutate(runKey(runId), current => ({ outboxCursor: Math.max(current.outboxCursor ?? 0, cursor) }))
+        acknowledged = cursor
+      }
+      if (cursor > acknowledged) await mutate(runKey(runId), current => ({ outboxCursor: Math.max(current.outboxCursor ?? 0, cursor) }))
+      return processed
+    },
+    async cleanupItem(PK, now = Date.now(), limit = 25, deadline = Infinity) {
+      if (!/^(RUN|EVENT)#/.test(PK) || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('Invalid cleanup request')
+      let item = await get(PK)
+      if (!item || typeof item.cleanupAt !== 'number' || item.cleanupAt > now) return
+      if (PK.startsWith('RUN#')) {
+        if (!terminal(item.run?.status)) return
+        if ((item.outboxEnd ?? 0) > (item.outboxCursor ?? 0)) {
+          await mutate(PK, current => ({ cleanupAt: now + 60_000 })); return
+        }
+        if (!item.deleted) {
+          item = await mutate(PK, current => {
+            if (!terminal(current.run?.status) || (current.outboxEnd ?? 0) > (current.outboxCursor ?? 0)) return undefined
+            return { deleted: true, purging: true }
+          })
+          if (!item?.deleted) return
+        }
+        const page = await client.send(new QueryCommand({ TableName, ConsistentRead: true,
+          KeyConditionExpression: 'PK = :pk AND begins_with(SK, :segment)',
+          ExpressionAttributeValues: { ':pk': PK, ':segment': 'SEG#' }, Limit: limit }))
+        for (const segment of page.Items ?? []) {
+          if (Date.now() + 10_000 >= deadline) return
+          await remove(PK, segment.SK)
+        }
+        if ((page.Items?.length ?? 0) > 0 || page.LastEvaluatedKey) return
+      }
+      // Compact tombstones block ID reuse and late delivery for the configured retry window.
+      item = await get(PK)
+      if (!item || typeof item.cleanupAt !== 'number' || item.cleanupAt > now) return
+      if (item.purgedAt !== undefined) {
+        await client.send(new DeleteCommand({ TableName, Key: key(PK), ConditionExpression: '#v = :v',
+          ExpressionAttributeNames: expressionNames, ExpressionAttributeValues: { ':v': item.version } }))
+      } else {
+        const tombstone = { ...key(PK), schemaVersion: STORAGE_VERSION, version: item.version + 1, deleted: true,
+          purgedAt: now, cleanupAt: now + limits.tombstoneRetentionMs,
+          ...(item.run ? { run: { runId: item.run.runId, workflowId: item.run.workflowId, status: item.run.status } } : { entityType: 'EVENT_TOMBSTONE' }) }
+        await client.send(new PutCommand({ TableName, Item: tombstone, ConditionExpression: '#v = :v',
+          ExpressionAttributeNames: expressionNames, ExpressionAttributeValues: { ':v': item.version } }))
+      }
+    },
     async claimStaleRun(args) {
       const item = await get(runKey(args.runId))
       return item && item.duePK === 'RUNNING' && item.dueSK <= args.now
@@ -263,7 +364,7 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
         const run: WorkflowExecution = { runId: state.runId, workflowId: state.workflowId, workflowVersion: state.workflowVersion, status: state.status, input: state.input, output: state.output, error: state.error, awaiting: state.awaiting, waitingFor: state.waitingFor, pendingApproval: state.pendingApproval, wakeAt: state.waitingFor?.signalName === '__timer' ? state.waitingFor.deadline : undefined, lease: previous?.lease, createdAt: state.createdAt, updatedAt: state.updatedAt }
         try {
           if (current) await replace(current, { state: copy(state), run, ...dueFields(run) })
-          else await put({ ...key(PK), version: 0, nextIndex: 0, state: copy(state), run, ...dueFields(run) })
+          else await put({ ...key(PK), version: 0, nextIndex: 0, state: copy(state), run, ...(terminal(run.status) ? { cleanupAt: Date.now() + limits.terminalRetentionMs } : {}), ...dueFields(run) })
           return
         } catch (error) { if (!isConflict(error)) throw error; await backoff(i) }
       }
@@ -274,7 +375,7 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
       const item = await get(PK)
       if (!item || item.deleted) return
       fence(item)
-      // Tombstone blocks accidental run resurrection. Event segments are retained for audit/explicit retention policy.
+      // Hide aborted runs immediately; committed effects still drain before retention cleanup.
       await mutate(PK, current => { fence(current); return { deleted: true, state: undefined, pending: undefined, run: { ...current.run, status: reason, lease: undefined }, duePK: undefined, dueSK: undefined } })
     },
     async appendEvents(args: AppendEventsArgs) {
@@ -283,9 +384,15 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
       if (!meta || meta.deleted || meta.nextIndex !== args.expectedNextIndex) throw new LogConflictError(args.runId, args.expectedNextIndex)
       fence(meta)
       if (!args.events.length) return { nextIndex: args.expectedNextIndex }
+      const bytes = Buffer.byteLength(JSON.stringify(args.events))
+      const terminalError = args.events.length === 1 && args.events[0]?.type === 'RUN_ERRORED'
+      if (meta.nextIndex + args.events.length > limits.maxHistoryEvents + (terminalError ? 1 : 0) || (meta.historyBytes ?? 0) + bytes > limits.maxHistoryBytes + (terminalError ? 16_384 : 0)) {
+        throw new WorkflowLimitError('History budget exceeded; continue as new before reaching the limit')
+      }
+      const hasEffects = args.events.some(event => committedEffect(event) !== undefined)
       const SK = `SEG#${randomUUID()}`
       // Stage immutable batch first, then publish it with one conditional update to the run item.
-      // Orphan segments from losing writers are invisible to readers and may be removed offline.
+      // Unreachable segments are invisible to readers and removed by terminal cleanup.
       const segment = { ...key(PK, SK), start: args.expectedNextIndex, events: stored(args.runId, args.expectedNextIndex, args.events), previous: meta.head }
       try { await put(segment) } catch (error) {
         // Retried immutable staging writes can report a conditional failure after success.
@@ -300,7 +407,7 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
         fence(current)
         try {
           // The version fences concurrent state changes; the lease owner rejects stale workers.
-          await client.send(new UpdateCommand({ TableName, Key: key(PK), UpdateExpression: 'SET head = :head, nextIndex = :next, #v = #v + :one' + (resolvesPending(args.events, current.pending) ? ' REMOVE #pending, #timerLease' : ''), ConditionExpression: owner() ? 'nextIndex = :index AND #v = :version AND #run.#lease.#owner = :owner' : 'nextIndex = :index AND #v = :version', ExpressionAttributeNames: { '#v': 'version', ...(resolvesPending(args.events, current.pending) ? { '#pending': 'pending', '#timerLease': 'timerLease' } : {}), ...(owner() ? { '#run': 'run', '#lease': 'lease', '#owner': 'owner' } : {}) }, ExpressionAttributeValues: { ':head': SK, ':next': args.expectedNextIndex + args.events.length, ':one': 1, ':index': args.expectedNextIndex, ':version': current.version, ...(owner() ? { ':owner': owner() } : {}) } }))
+          await client.send(new UpdateCommand({ TableName, Key: key(PK), UpdateExpression: 'SET head = :head, nextIndex = :next, historyBytes = :bytes, #v = #v + :one' + (hasEffects ? ', outboxEnd = :next' : '') + (resolvesPending(args.events, current.pending) ? ' REMOVE #pending, #timerLease' : ''), ConditionExpression: owner() ? 'nextIndex = :index AND #v = :version AND #run.#lease.#owner = :owner' : 'nextIndex = :index AND #v = :version', ExpressionAttributeNames: { '#v': 'version', ...(resolvesPending(args.events, current.pending) ? { '#pending': 'pending', '#timerLease': 'timerLease' } : {}), ...(owner() ? { '#run': 'run', '#lease': 'lease', '#owner': 'owner' } : {}) }, ExpressionAttributeValues: { ':head': SK, ':next': args.expectedNextIndex + args.events.length, ':bytes': (current.historyBytes ?? 0) + bytes, ':one': 1, ':index': args.expectedNextIndex, ':version': current.version, ...(owner() ? { ':owner': owner() } : {}) } }))
           return { nextIndex: args.expectedNextIndex + args.events.length }
         } catch (error) {
           // A timeout (or an SDK retry whose first attempt committed) is ambiguous.
@@ -363,23 +470,26 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
       if (!Number.isFinite(args.now) || (args.nextFireAt !== undefined && !Number.isFinite(args.nextFireAt))) {
         throw new Error('Schedule timestamps must be finite')
       }
+      nextScheduleTime(args.schedule, args.now)
+      const missedTickPolicy = args.missedTickPolicy ?? 'run-once'
+      const maxCatchUp = args.maxCatchUp ?? 10
+      if (!['skip', 'run-once', 'catch-up'].includes(missedTickPolicy) || !Number.isInteger(maxCatchUp) || maxCatchUp < 1 || maxCatchUp > 100) throw new Error('Invalid missed-tick policy or catch-up bound')
       const PK = scheduleKey(args.scheduleId)
-      const fields = { scheduleId: args.scheduleId, workflowId: args.workflowId, workflowVersion: args.workflowVersion, spec: args.schedule, overlapPolicy: args.overlapPolicy, input: args.input, nextFireAt: args.nextFireAt, enabled: args.enabled, definitionUpdatedAt: args.now }
+      const fields = { missedTickPolicy, maxCatchUp, scheduleId: args.scheduleId, workflowId: args.workflowId, workflowVersion: args.workflowVersion, spec: args.schedule, overlapPolicy: args.overlapPolicy, input: args.input, nextFireAt: args.nextFireAt ?? nextScheduleTime(args.schedule, args.now), enabled: args.enabled, definitionUpdatedAt: args.now }
       const existing = await get(PK)
       if (!existing) {
-        try { await put({ ...key(PK), version: 0, ...fields, ...scheduleDueFields(fields) }); return }
+        try { await put({ ...key(PK), version: 0, generation: 1, ...fields, ...scheduleDueFields(fields) }); return }
         catch (error) { if (!isConflict(error)) throw error }
       }
       await mutate(PK, current => {
         // A delayed materializer must not roll the schedule back or replace a newer definition.
         if (current.definitionUpdatedAt > args.now) return undefined
-        if (current.workflowId !== args.workflowId || current.overlapPolicy !== args.overlapPolicy) {
-          throw new Error('Schedule workflowId and overlapPolicy are immutable; use a new scheduleId')
-        }
-        if (args.enabled && current.enabled && args.nextFireAt !== undefined && current.nextFireAt !== undefined && args.nextFireAt < current.nextFireAt) return undefined
-        const nextFireAt = args.nextFireAt
-        const next = { ...current, ...fields, nextFireAt }
-        return { ...fields, nextFireAt, ...scheduleDueFields(next) }
+        const nextFireAt = fields.nextFireAt
+        const definition = (value: Item) => ({ workflowId: value.workflowId, workflowVersion: value.workflowVersion, spec: value.spec,
+          overlapPolicy: value.overlapPolicy, input: value.input, enabled: value.enabled, missedTickPolicy: value.missedTickPolicy, maxCatchUp: value.maxCatchUp })
+        if (isDeepStrictEqual(definition(current), definition(fields))) return undefined
+        const next = { ...current, ...fields, nextFireAt, generation: current.generation + 1, lastStartedAt: undefined, lastBucketId: undefined, catchUpRemaining: undefined }
+        return { ...fields, nextFireAt, generation: next.generation, lastStartedAt: undefined, lastBucketId: undefined, catchUpRemaining: undefined, ...scheduleDueFields(next) }
       })
     },
     async claimDueScheduleBuckets(args) { return candidates('SCHEDULE', args.now, args.limit, item => claimScheduleItem(item, args)) },
@@ -388,15 +498,26 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
       if (!leaseOwner) throw new Error('withLeaseOwner is required to mark a schedule bucket started')
       await mutate(scheduleKey(args.scheduleId), schedule => {
         const pending = schedule.pendingBucket
-        if (!pending && String(schedule.lastStartedAt) === args.bucketId && schedule.activeRunId === args.runId) return undefined
+        if (!pending && schedule.lastBucketId === args.bucketId && schedule.activeRunId === args.runId) return undefined
         if (!pending || pending.bucketId !== args.bucketId || pending.runId !== args.runId || pending.lease.owner !== leaseOwner) {
           throw new Error('Lost schedule bucket lease or mismatched bucket')
         }
-        const next = { ...schedule, pendingBucket: undefined, lastStartedAt: pending.fireAt, activeRunId: args.runId }
-        return { pendingBucket: undefined, lastStartedAt: pending.fireAt, activeRunId: args.runId, ...scheduleDueFields(next) }
+        const advanced = pending.generation === schedule.generation ? advanceSchedule(schedule, pending.fireAt, args.now) : {}
+        const changes = { ...advanced, pendingBucket: undefined, lastStartedAt: pending.generation === schedule.generation ? pending.fireAt : undefined,
+          lastBucketId: args.bucketId, activeRunId: args.runId }
+        return { ...changes, ...scheduleDueFields({ ...schedule, ...changes }) }
       })
     },
     async deferRunRecovery(args) {
+      if (args.error instanceof WorkflowLimitError) {
+        const error = args.error
+        await mutate(runKey(args.runId), current => {
+          if (current.deleted || terminal(current.run.status) || (current.run.lease && current.run.lease.owner !== args.leaseOwner)) return undefined
+          const run = { ...current.run, status: 'errored', error: { name: error.name, message: error.message }, lease: undefined }
+          return { run, state: undefined, pending: undefined, ...dueFields(run) }
+        })
+        return
+      }
       await mutate(runKey(args.runId), current => {
         if (current.deleted || terminal(current.run.status) || (current.run.lease && current.run.lease.owner !== args.leaseOwner)) return undefined
         const run = { ...current.run, lease: lease(args.leaseOwner, 60_000, Math.max(args.now, Date.now())) }

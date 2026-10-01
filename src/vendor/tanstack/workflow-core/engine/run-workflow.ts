@@ -98,9 +98,12 @@ export async function* runWorkflow(
 
   // Start execution in the background. Errors are routed through
   // emit() as RUN_ERRORED, so this promise rarely rejects on its own.
+  let executionFailed = false
+  let executionError: unknown
   const exec = drive({ ...options, emit })
-    .catch(() => {
-      // Defensive — every error path in `drive` should emit RUN_ERRORED.
+    .catch(error => {
+      executionFailed = true
+      executionError = error
     })
     .finally(() => {
       executionDone = true
@@ -143,6 +146,7 @@ export async function* runWorkflow(
   }
 
   await exec
+  if (executionFailed) throw executionError
 }
 
 // ============================================================
@@ -286,6 +290,21 @@ async function resumeRun(options: DriveOptions): Promise<void> {
     return
   }
 
+  // A terminal checkpoint may commit before its state write. Complete that
+  // checkpoint without rerunning the handler or appending another terminal event.
+  const history = await runStore.getEvents(runId)
+  const terminalEvent = history.find(event => event.type === 'RUN_FINISHED' || event.type === 'RUN_ERRORED')
+  if (terminalEvent?.type === 'RUN_FINISHED' || terminalEvent?.type === 'RUN_ERRORED') {
+    await runStore.setRunState(runId, { ...persistedState,
+      status: terminalEvent.type === 'RUN_FINISHED' ? 'finished' : terminalEvent.code === 'aborted' ? 'aborted' : 'errored',
+      output: terminalEvent.type === 'RUN_FINISHED' ? terminalEvent.output : undefined,
+      error: terminalEvent.type === 'RUN_ERRORED' ? terminalEvent.error : undefined,
+      updatedAt: Date.now(),
+    })
+    emit(terminalEvent)
+    return
+  }
+
   // Route to the right code version for this run.
   const effectiveWorkflow = selectVersionForRun(workflow, persistedState)
   if (!effectiveWorkflow) {
@@ -305,8 +324,6 @@ async function resumeRun(options: DriveOptions): Promise<void> {
     })
     return
   }
-
-  const history = await runStore.getEvents(runId)
 
   // Append the seed delivery before driving the handler. Replay's
   // history lookup will then find the SIGNAL_RESOLVED / APPROVAL_RESOLVED
@@ -546,7 +563,6 @@ async function driveHandler(args: DriveHandlerArgs): Promise<void> {
     if (abortController.signal.aborted) {
       args.runState.status = 'aborted'
       args.runState.updatedAt = Date.now()
-      await runStore.setRunState(runId, args.runState)
       const errEvent: WorkflowEvent = {
         type: 'RUN_ERRORED',
         ts: Date.now(),
@@ -557,17 +573,17 @@ async function driveHandler(args: DriveHandlerArgs): Promise<void> {
       await emitAndAppend(
         runStore,
         runId,
-        engine.nextLogIndex++,
+        (await runStore.getEvents(runId)).length,
         emit,
         errEvent,
       )
+      await runStore.setRunState(runId, args.runState)
       return
     }
 
     args.runState.status = 'errored'
     args.runState.error = serializeError(err)
     args.runState.updatedAt = Date.now()
-    await runStore.setRunState(runId, args.runState)
     const errEvent: WorkflowEvent = {
       type: 'RUN_ERRORED',
       ts: Date.now(),
@@ -575,7 +591,8 @@ async function driveHandler(args: DriveHandlerArgs): Promise<void> {
       error: serializeError(err),
       code: 'error',
     }
-    await emitAndAppend(runStore, runId, engine.nextLogIndex++, emit, errEvent)
+    await emitAndAppend(runStore, runId, (await runStore.getEvents(runId)).length, emit, errEvent)
+    await runStore.setRunState(runId, args.runState)
     return
   }
 
@@ -584,7 +601,6 @@ async function driveHandler(args: DriveHandlerArgs): Promise<void> {
   args.runState.status = 'finished'
   args.runState.output = output
   args.runState.updatedAt = Date.now()
-  await runStore.setRunState(runId, args.runState)
   const finishedEvent: WorkflowEvent = {
     type: 'RUN_FINISHED',
     ts: Date.now(),
@@ -598,6 +614,7 @@ async function driveHandler(args: DriveHandlerArgs): Promise<void> {
     emit,
     finishedEvent,
   )
+  await runStore.setRunState(runId, args.runState)
 }
 
 // ============================================================

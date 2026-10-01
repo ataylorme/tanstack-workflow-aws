@@ -10,11 +10,11 @@ This guide targets an existing Start application deployed active/active in `us-e
 | Workflow runtime | In server code and targeted worker Lambda | In server code and targeted worker Lambda | — |
 | DynamoDB MRSC | Read/write replica | Read/write replica | Witness |
 | Aurora DSQL | Local endpoint of your peered database | Local endpoint of your peered database | Witness if configured for this topology |
-| Workflow wakeups | Stream → dispatcher → one-time Scheduler/SQS → targeted worker | Same independent regional path | — |
+| Workflow wakeups | Stream → router → one-time Scheduler/SQS → targeted worker | Same independent regional path | — |
 
 Each service maintains its own replication and quorum. Selecting Ohio for both witnesses does not make DSQL and DynamoDB one database or one transaction domain. The example templates provision the workflow infrastructure only; your application owns its DSQL clusters and permissions. Use each Region's local endpoints.
 
-A recommended deployment uses the Start web function, a stream dispatcher, and a native targeted workflow function per application Region. Web and worker functions bundle the same workflow registry and compatible workflow versions and use the same table name. This gives background work its own concurrency allocation and execution budget. Neither Region permanently owns a run. An expired execution lease can be reclaimed by the other Region when the DynamoDB quorum is available.
+A recommended deployment uses the Start web function, a unified stream router, a native targeted workflow function and an application queue consumer per application Region. Web and worker functions bundle the same workflow registry and matching workflow versions and use the same table name. This gives background work its own concurrency allocation and execution budget. Neither Region permanently owns a run. An expired execution lease can be reclaimed by the other Region when the DynamoDB quorum is available.
 
 ## Call workflows from Start server code
 
@@ -59,13 +59,13 @@ Await the runtime call before returning the HTTP response. Do not detach it with
 
 ## Deploy the dedicated worker
 
-1. Deploy [`global-table.yaml`](../cloudformation/global-table.yaml) once from `us-west-2`. It creates the east/west replicas and an Ohio witness. This is a fresh-table example; changing an existing MRSC witness/replica topology is not an in-place migration procedure. Wait until the table and replicas are ACTIVE. See [MRSC provisioning](mrsc-deployment.md) for the explicit CloudFormation service-role option and safe handling of a retained table after partial creation.
-2. Follow [the wakeup build and deployment commands](workflow-wakeups.md#build-and-deploy) to bundle `sweeper.js` and `dispatcher.js` (the standalone `handler.js` may be included but is unused here). Install the Scheduler SDK in your application's build dependencies when copying the examples. Keep the worker's `./runtime.js` imports wired to the same workflow registry as the web application.
-3. Deploy [`sweeper.yaml`](../cloudformation/sweeper.yaml) in each Region with the local table stream ARN, local artifact bucket and immutable ZIP key. Fresh deployments use `LegacyScheduleMode=removed`; follow [migration](workflow-wakeups.md#migrate-existing-polling-stacks) for an existing recurring sweeper.
-4. Give both Start web functions the DynamoDB workflow data-plane permissions shown in the sweeper role and set `TABLE_NAME`. Do not copy the dispatcher's Scheduler, SQS, or `iam:PassRole` permissions into the web role. Add your workflows' DSQL settings and permissions to both web and worker functions; the example itself does not connect to DSQL.
+1. Deploy [`global-table.yaml`](../cloudformation/global-table.yaml) once from `us-west-2`. It creates the east/west replicas and an Ohio witness. Wait until the table and replicas are ACTIVE. See [MRSC provisioning](mrsc-deployment.md) for the explicit CloudFormation service-role option and safe handling of a retained table after partial creation.
+2. Follow [the wakeup build and deployment commands](workflow-wakeups.md#build-and-deploy) to bundle `worker.js`, `router.js` and `application-consumer.js` (the standalone `handler.js` is unused here). Install the Scheduler, SQS and SNS SDKs in your application's build dependencies when copying the examples. Keep the worker's `./runtime.js` imports wired to the same workflow registry as the web application.
+3. Deploy [`workers.yaml`](../cloudformation/workers.yaml) in each Region with the local table stream ARN, local artifact bucket and immutable ZIP key. The stack creates the unified stream router, targeted workflow worker and independent application delivery worker.
+4. Give both Start web functions the DynamoDB workflow data-plane permissions shown in the worker role and set `TABLE_NAME`. Do not copy the router's Scheduler, SQS, or `iam:PassRole` permissions into the web role. Add your workflows' DSQL settings and permissions to both web and worker functions; the example itself does not connect to DSQL.
 5. Reuse existing CloudFront/Lambda@Edge ingress. The standalone `regional.yaml` and `edge.yaml` are unnecessary for an embedded integration.
 
-Neither dispatcher nor worker needs Lambda Web Adapter or a public HTTP endpoint. Retain compatible workflow loaders in both Regions for every in-flight version. A single HTTP `/events` pass-through handler is not a drop-in replacement: it would also need the SQS partial-batch failure and durable-continuation protocol. Prefer the dedicated private functions rather than exposing an administrative sweep route.
+Neither router nor worker needs Lambda Web Adapter or a public HTTP endpoint. Retain workflow loaders in both Regions for every in-flight version. A single HTTP `/events` pass-through handler is not a drop-in replacement: it would also need the SQS partial-batch failure and durable-continuation protocol. Prefer the dedicated private functions rather than exposing administrative recovery endpoints.
 
 ## DSQL writes and workflow handoff
 
@@ -74,7 +74,7 @@ A business transaction committed to DSQL and a workflow write to DynamoDB are se
 For workflows triggered by business mutations, implement a transactional outbox in your application's DSQL schema:
 
 1. Commit the business change and an outbox row with a stable operation/run ID in the **same DSQL transaction**.
-2. Regional dispatchers read pending rows and submit the same operation ID to the workflow runtime. If using a DSQL claim, use conditional updates and transaction retries; do not assume PostgreSQL row locks are available. Keep external service calls outside the DSQL transaction.
+2. Regional routers read pending rows and submit the same operation ID to the workflow runtime. If using a DSQL claim, use conditional updates and transaction retries; do not assume PostgreSQL row locks are available. Keep external service calls outside the DSQL transaction.
 3. Acknowledge the outbox row only once the application has a durable recovery path for the submitted operation. A worker dying after submission but before acknowledgement must be harmless to retry.
 
 The store indexes queued submissions and expired or released running runs for recovery. Signal and approval acceptance also retain their payload until the resolution event commits. DynamoDB Local regression tests cover crashes at these boundaries. A durable `createRun` record is therefore recoverable by targeted workers, provided the matching workflow remains registered in both Regions. Keep outbox reconciliation for failures before submission, unavailable services, incompatible workflow deployments, and operator intervention; validate the complete DSQL-to-DynamoDB handoff on AWS. This package does not implement the DSQL outbox itself.
@@ -85,7 +85,7 @@ Within a workflow step that mutates DSQL, use a stable per-step operation key. R
 
 Lambda@Edge placement and regional health routing are independent of workflow execution. Existing HTTP traffic routing does not assign durable run ownership. A signal can arrive in the opposite Region from the original request; the shared MRSC store arbitrates the claim. Continue using stable operation IDs for client retries, and verify how your edge layer reroutes mutation requests during an outage. The standalone edge sample is deterministic placement, not automatic POST failover.
 
-This integration does not remove the prototype limits documented in the main README. Test with real MRSC replicas, the application's actual Start build and Lambda Web Adapter version, DSQL transaction retries, and both regional stacks before relying on cross-Region recovery.
+Configure the history and retention limits documented in [lifecycle](lifecycle.md). Test with real MRSC replicas, the application's actual Start build and Lambda Web Adapter version, DSQL transaction retries, and both regional stacks before relying on cross-Region recovery.
 
 ## References
 

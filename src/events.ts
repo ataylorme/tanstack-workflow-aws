@@ -30,7 +30,7 @@ export interface PublishApplicationEventOptions<T> {
 export interface DynamoApplicationEventPublisherOptions {
   tableName: string
   client?: DynamoDBDocumentClient
-  partitionKeyPrefix?: string
+  retentionMs?: number
 }
 
 export interface ApplicationEventPublisher {
@@ -47,14 +47,14 @@ export function createDynamoApplicationEventPublisher(
 ): ApplicationEventPublisher {
   const client =
     options.client ??
-    DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+    DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 3, requestHandler: { connectionTimeout: 1_000, requestTimeout: 4_000, throwOnRequestTimeout: true } }), {
       marshallOptions: { removeUndefinedValues: true },
     })
+  const retentionMs = options.retentionMs ?? 7 * 86400_000
+  if (!Number.isSafeInteger(retentionMs) || retentionMs <= 0) throw new TypeError('retentionMs must be positive')
   const TableName = options.tableName
-  const prefix = options.partitionKeyPrefix ?? 'EVENT'
 
   if (!TableName) throw new Error('tableName is required')
-  if (!prefix || Buffer.byteLength(prefix) > 512) throw new Error('partitionKeyPrefix must be nonempty and at most 512 bytes')
 
   return {
     async publish<T>(input: PublishApplicationEventOptions<T>): Promise<ApplicationEvent<T>> {
@@ -72,12 +72,12 @@ export function createDynamoApplicationEventPublisher(
       // Snapshot before asynchronous I/O so caller mutation cannot alter a retry.
       const snapshot = JSON.parse(serializeApplicationEvent(event)) as ApplicationEvent<T>
       const timestampWasProvided = input.timestamp !== undefined
-      const Key = { PK: `${prefix}#${snapshot.id}`, SK: 'META' }
+      const Key = { PK: `EVENT#${snapshot.id}`, SK: 'META' }
       for (let attempt = 0; ; attempt++) {
         try {
           await client.send(new PutCommand({
             TableName,
-            Item: { ...Key, entityType: 'APPLICATION_EVENT', event: snapshot,
+            Item: { ...Key, schemaVersion: 1, version: 0, cleanupAt: Date.now() + retentionMs, entityType: 'APPLICATION_EVENT', event: snapshot,
               eventType: snapshot.type, eventVersion: snapshot.version, createdAt: snapshot.timestamp },
             ConditionExpression: 'attribute_not_exists(PK)',
           }))
@@ -89,6 +89,7 @@ export function createDynamoApplicationEventPublisher(
           try { existing = (await client.send(new GetCommand({ TableName, Key, ConsistentRead: true }))).Item }
           catch { throw error }
           if (existing) {
+            if (existing.deleted) throw new ApplicationEventConflictError(snapshot.id)
             const stored = existing.event as ApplicationEvent<T>
             const expected = { ...snapshot, ...(!timestampWasProvided ? { timestamp: stored?.timestamp } : {}) }
             if (existing.entityType !== 'APPLICATION_EVENT' || !isDeepStrictEqual(stored, expected)) {

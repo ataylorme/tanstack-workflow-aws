@@ -14,7 +14,7 @@ Resources:
       BillingMode: PAY_PER_REQUEST
       MultiRegionConsistency: STRONG
       StreamSpecification:
-        StreamViewType: NEW_IMAGE
+        StreamViewType: NEW_AND_OLD_IMAGES
       AttributeDefinitions:
         - { AttributeName: PK, AttributeType: S }
         - { AttributeName: SK, AttributeType: S }

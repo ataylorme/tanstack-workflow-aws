@@ -22,10 +22,6 @@ export async function handler(event: Request, context: LambdaContext) {
   const owner = `${process.env.AWS_REGION}:${context.awsRequestId}`
   const remaining = context.getRemainingTimeInMillis()
   return store.withLeaseOwner(owner, async () => {
-    if (event.kind === 'sweep') {
-      if (remaining <= 2_000) throw new Error('Insufficient time to start a workflow sweep')
-      return runtime.sweep({ leaseOwner: owner, deadline: Date.now() + remaining - 2_000, limit: 20, includeEvents: false })
-    }
     // HTTP API has a shorter timeout than the Lambda. Yield before its response
     // budget expires; individual workflow steps must also bound their own I/O.
     if (remaining <= 2_000) return response(503, { error: 'Insufficient execution time; retry with the same IDs' })

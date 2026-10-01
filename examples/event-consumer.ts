@@ -1,4 +1,4 @@
-import { createApplicationStreamHandler } from '../src/event-stream.js'
+import { createApplicationQueueHandler } from '../src/wakeups.js'
 import { routeApplicationEvent } from '../src/events.js'
 import type { ApplicationEvent } from '../src/events.js'
 
@@ -10,16 +10,15 @@ async function project(event: ApplicationEvent) {
   console.log('project', event.id, event.data)
 }
 
-// These are alternative entrypoints. For a global table, use one stream reader
-// and fan out through queues if independent side-effect retries are needed.
+// Subscribe separate queues to the application topic for independent retries.
 // Every real consumer must deduplicate by event.id.
-export const notificationHandler = createApplicationStreamHandler(event =>
+export const notificationHandler = createApplicationQueueHandler(event =>
   routeApplicationEvent(event, [
     { type: 'task.requested', handler: notify },
     { type: 'task.completed', handler: notify },
   ]).then(() => {}),
 )
-export const projectionHandler = createApplicationStreamHandler(event =>
+export const projectionHandler = createApplicationQueueHandler(event =>
   routeApplicationEvent(event, [
     { type: 'task.approved', handler: project },
     { type: 'task.started', handler: project },

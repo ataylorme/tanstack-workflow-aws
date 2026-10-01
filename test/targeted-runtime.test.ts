@@ -84,9 +84,9 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('targeted execution without disc
     expect(first.scheduled).toHaveLength(1)
     expect(await store.loadRun(old!.runId)).toMatchObject({ status: 'finished', output: { fireAt: now } })
     expect(await store.loadRun(`task:other:${now}`)).toBeUndefined()
-    expect(await store.loadRun(`task:one:${now + 100}`)).toBeUndefined()
+    expect(await store.loadRun(`task:one:2:${now + 100}`)).toBeUndefined()
     await process(now + 101)
-    expect(await store.loadRun(`task:one:${now + 100}`)).toMatchObject({ status: 'finished' })
+    expect(await store.loadRun(`task:one:2:${now + 100}`)).toMatchObject({ status: 'finished' })
     expect((await process(now + 102)).scheduled).toEqual([])
   })
 

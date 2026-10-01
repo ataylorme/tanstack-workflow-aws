@@ -5,10 +5,10 @@ import { createEventBridgeBridge } from '../src/bridges-eventbridge.js'
 import { createSnsBridge } from '../src/bridges-sns.js'
 import { createSqsBridge } from '../src/bridges-sqs.js'
 import { createWebhookBridge } from '../src/bridges-webhook.js'
-import { createApplicationStreamHandler } from '../src/event-stream.js'
+import { createApplicationQueueHandler } from '../src/wakeups.js'
 import type { ApplicationEventHandler } from '../src/events.js'
 
-// Deploy this bundle as a separate Lambda for each destination. Set BRIDGE_KIND
+// Deploy this bundle behind a dedicated application subscription queue. Set BRIDGE_KIND
 // and the corresponding target variable in that Lambda's environment.
 const clientOptions = { maxAttempts: 2, requestHandler: { connectionTimeout: 1_000, requestTimeout: 4_000, throwOnRequestTimeout: true } }
 const kind = process.env.BRIDGE_KIND
@@ -32,4 +32,4 @@ switch (kind) {
   default: throw new Error(`Unknown BRIDGE_KIND: ${kind}`)
 }
 
-export const handler = createApplicationStreamHandler(bridge, { minRemainingTimeMs: 15_000 })
+export const handler = createApplicationQueueHandler(bridge)

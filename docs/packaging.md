@@ -17,24 +17,17 @@ npm run test:package
 
 This packs the package, installs the tarball into an unrelated temporary project, imports the public entry point, constructs the store without contacting AWS, and typechecks a consumer against the upstream store interface. It needs npm registry access (or a populated npm cache) for the consumer's production dependencies. The docs, deployment templates, example sources and store source are included alongside the compiled library.
 
-## Updating the AWS examples
+## Regional deployment artifacts
 
-Upload each new regional Lambda bundle under a new, immutable S3 `CodeKey`, or enable S3 versioning and pass the new `CodeObjectVersion`. CloudFormation does not detect overwritten bytes at the same S3 bucket/key. Bundle `handler.js`, `sweeper.js`, and `dispatcher.js` together as described in [demand-driven wakeups](workflow-wakeups.md). The standalone API uses `regional.yaml`; both standalone and existing applications deploy `sweeper.yaml` separately in each Region. Its stream dispatcher and SQS worker use the same artifact. The Scheduler SDK is an example build dependency, not an automatic library feature; install it when copying these examples into another application.
+Bundle `handler.js`, `worker.js`, `router.js` and `application-consumer.js` using the commands in [demand-driven wakeups](workflow-wakeups.md). Deploy `workers.yaml` per replica. `regional.yaml` supplies the optional standalone HTTP API. The AWS transport subpath requires Scheduler and SQS peers; the example application consumer also requires SNS.
 
-The edge template's `RouterRevision` must change whenever its inline routing code changes. Its published version description also includes both API domains, so a changed endpoint creates a new version and updates the CloudFront association. Old edge versions are retained because CloudFront replicas cannot be deleted immediately after association changes; remove unused versions manually after replication has completed and AWS allows deletion.
+Use immutable S3 artifact keys or explicit object versions. CloudFormation does not detect overwritten bytes at the same bucket/key. Web and worker bundles must contain the same workflow registry and matching engine. The edge template's `RouterRevision` identifies its inline routing code; published versions are retained until CloudFront replication permits their removal.
 
-These checks establish that the artifact can be consumed and the templates are syntactically valid. They do not establish live MRSC replication or regional failover behavior.
+The installed-package check verifies all public subpaths, injectable handler types, targeted processing and independent optional SDK dependencies. Template and bundle checks establish artifact integrity; live MRSC and regional failure behavior require AWS acceptance tests.
 
 ## Pinned workflow engine
 
-This package includes the TanStack Workflow core/runtime source snapshot at commit
-`b9287174b44424059895a0ed834b18ce50e0484a`. Its MIT license and provenance notice
-are distributed under `src/vendor/tanstack`. ESM imports are rewritten for packaging. Small recovery patches persist terminal
-validation/version errors, isolate failed claims with retry backoff, and add the host `processTarget` API with optional direct store claims;
-the provenance notice enumerates these changes. The snapshot includes interrupted-run
-recovery absent from the published core/runtime packages at review time.
-
-Use the supported matching engine exports:
+The package includes TanStack Workflow core/runtime at commit `b9287174b44424059895a0ed834b18ce50e0484a`. The MIT license and provenance notice are distributed under `src/vendor/tanstack`. Host extensions provide fenced recovery, direct targeted claims and self-advancing schedule integration. Use the matching engine exports:
 
 ```ts
 import { createWorkflow } from '@ataylorme/tanstack-workflow-aws/workflow'
@@ -42,12 +35,7 @@ import { defineWorkflowRuntime } from '@ataylorme/tanstack-workflow-aws/runtime'
 import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
 ```
 
-Do not combine this store with separately installed `@tanstack/workflow-core` or
-`@tanstack/workflow-runtime` engines. The supported and tested execution contract
-is the included snapshot; similarly named npm releases may lack its recovery
-behavior. This approach does not patch or replace dependencies in the consuming
-application. Upgrade the snapshot and rerun recovery tests together when adopting
-future upstream changes.
+The supported execution contract is the included engine and its recovery tests. Keep the source notice and rerun the full suite when changing the engine snapshot. `cron-parser` is pinned to make cron evaluation reproducible across deployed bundles.
 
 ## GitHub Packages releases and CI
 
@@ -60,6 +48,6 @@ The npm package name is `@ataylorme/tanstack-workflow-aws`. Configure the scope 
 
 Set `NODE_AUTH_TOKEN` locally to a GitHub personal access token (classic) with `read:packages`; never commit the token. Then install with `npm install @ataylorme/tanstack-workflow-aws`. GitHub Actions consumers can use their `GITHUB_TOKEN` when granted access to the package. Package visibility and consumer access are managed in GitHub Packages settings.
 
-To release, update `version` in both package manifests, merge the change, and publish a GitHub release tagged `v<VERSION>` (for example `v0.1.0`) at that commit. The release workflow verifies the tag matches the manifest and runs the reusable test workflow before publishing using its built-in `GITHUB_TOKEN` with `packages: write`. No separate publishing secret is required. Prereleases use the `next` npm dist-tag; regular releases use `latest`. Each version can be published only once. This change configures publishing but does not create a release.
+To release, update `version` in both package manifests, merge the change, and publish a GitHub release tagged `v<VERSION>` (for example `v0.2.0-rc.0`) at that commit. The release workflow verifies the tag matches the manifest and runs the reusable test workflow before publishing using its built-in `GITHUB_TOKEN` with `packages: write`. No separate publishing secret is required. Prereleases use the `next` npm dist-tag; regular releases use `latest`. Each version can be published only once. Updating a branch does not publish a package release.
 
 PRs and pushes to `main` run typecheck, build, all tests against DynamoDB Local, an installed-package smoke test and Lambda bundle checks on Node 20, 22 and 24. The Node 22 job also lints CloudFormation. Tests use read-only repository permissions and no AWS credentials. The same workflow runs on the release commit before publication. Repository administrators can require the three `Test Node` checks through branch protection.
