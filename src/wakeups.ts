@@ -200,7 +200,7 @@ export function createWorkflowWorker(options: {
 }
 
 /** Downstream business handlers receive at-least-once envelopes from their own queue. */
-export function createApplicationQueueHandler(handler: ApplicationEventHandler) {
+export function createApplicationQueueHandler(handler: ApplicationEventHandler, options: { fifo?: boolean } = {}) {
   return async (batch: QueueBatch, context?: Pick<WorkerContext, 'getRemainingTimeInMillis'>) => {
     const batchItemFailures: { itemIdentifier: string }[] = []
     for (const message of batch.Records) {
@@ -212,6 +212,11 @@ export function createApplicationQueueHandler(handler: ApplicationEventHandler) 
       } catch (error) {
         console.error(JSON.stringify({ kind: 'application_event_delivery_failed', messageId: message.messageId, error: error instanceof Error ? error.name : 'Error' }))
         batchItemFailures.push({ itemIdentifier: message.messageId })
+        if (options.fifo) {
+          const index = batch.Records.indexOf(message)
+          batchItemFailures.push(...batch.Records.slice(index + 1).map(record => ({ itemIdentifier: record.messageId })))
+          break
+        }
       }
     }
     return { batchItemFailures }

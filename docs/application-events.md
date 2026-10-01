@@ -1,6 +1,6 @@
 # Application events and committed workflow effects
 
-The unified DynamoDB Stream router durably fans out immutable application facts to the application queue. Its private application worker publishes to the regional SNS topic. Independent consumers subscribe through their own queues and deduplicate by event ID. Workflow execution and application delivery have separate concurrency, retry and dead-letter queues. Deploy exactly one router mapping per replica; downstream consumers do not attach to that stream.
+The unified DynamoDB Stream router durably fans out immutable application facts to the application FIFO queue. Its private application worker publishes to the regional SNS FIFO topic. Ordered consumers subscribe through their own FIFO queues and share a durable cursor across Regions. Workflow execution and application delivery have separate concurrency, retry and dead-letter queues. Deploy exactly one router mapping per replica; downstream consumers do not attach to that stream.
 
 ```mermaid
 flowchart TD
@@ -8,12 +8,16 @@ flowchart TD
   Producer["Application producer"] --> Events["DynamoDB event item"]
   Outbox --> Events
   Events --> Router["Unified stream router"]
-  Router --> Queue["Application queue"]
+  Router --> Queue["Application FIFO queue"]
   Queue --> Worker["Application worker"]
-  Worker --> Topic["SNS topic"]
-  Topic --> Notifications["Notification queue"]
-  Topic --> Projections["Projection queue"]
+  Worker --> Topic["SNS FIFO topic"]
+  Topic --> Notifications["Ordered notification subscriber"]
+  Topic --> Projections["Ordered projection subscriber"]
 ```
+
+## Ordering contract
+
+Use `ordering: { streamId, sequence }` and `createDynamoOrderedSubscriber` for strict per-entity callback order across Regions. The [ordered event guide](ordered-events.md) defines contiguous publication, the requested → approved → started → completed example, shared subscriber cursors, and fail-closed recovery for uncertain effects. Envelopes without `ordering` are independent facts with no business-order guarantee. The workflow outbox preserves ordering fields supplied to `publishWorkflowEvent`.
 
 ## Publish
 
@@ -46,12 +50,14 @@ Application database mutations and direct publication are separate operations. P
 ```ts
 import { createApplicationQueueHandler } from '@ataylorme/tanstack-workflow-aws/wakeups'
 import { createSqsBridge } from '@ataylorme/tanstack-workflow-aws/bridges/sqs'
+import { applicationEventGroupId } from '@ataylorme/tanstack-workflow-aws/ordered-events'
 export const handler = createApplicationQueueHandler(
-  createSqsBridge({ queueUrl: process.env.DESTINATION_QUEUE_URL! }),
+  createSqsBridge({ queueUrl: process.env.DESTINATION_FIFO_QUEUE_URL!, messageGroupId: applicationEventGroupId }),
+  { fifo: true },
 )
 ```
 
-Queue handlers validate envelopes, isolate per-message failures and return SQS message IDs in `batchItemFailures`. Enable `ReportBatchItemFailures`. A remaining-time guard avoids starting work near timeout; handlers must bound their own I/O. Failure logs use `application_event_delivery_failed` without payloads. The standard deployment uses [application-consumer.ts](../examples/application-consumer.ts); [event-bridge-handler.ts](../examples/event-bridge-handler.ts) demonstrates configurable downstream bridges.
+Queue handlers validate envelopes, isolate per-message failures and return SQS message IDs in `batchItemFailures`. Enable `ReportBatchItemFailures` and pass `{ fifo: true }` to the relay queue handler for FIFO batch failure handling. Business subscribers requiring ordering use `createDynamoOrderedSubscriber`, not this relay adapter. A remaining-time guard avoids starting work near timeout; handlers must bound their own I/O. Failure logs use `application_event_delivery_failed` without payloads. The standard deployment uses [application-consumer.ts](../examples/application-consumer.ts); [event-bridge-handler.ts](../examples/event-bridge-handler.ts) demonstrates configurable downstream bridges.
 
 | Subpath | Factory | Optional SDK peer | Destination body |
 | --- | --- | --- | --- |
@@ -62,7 +68,7 @@ Queue handlers validate envelopes, isolate per-message failures and return SQS m
 
 Each AWS bridge accepts an injected client. Set Region, retry counts and request timeouts within the Lambda budget. EventBridge checks individual entry failures; provision the bus and verify an actual receiving target. SNS subscriptions receiving these events through `createApplicationQueueHandler` must enable raw message delivery so each queue body is the event envelope. Give each independent consumer its own subscription queue.
 
-FIFO destinations require a `messageGroupId` function. Bridges hash the event ID for the deduplication ID, but destination idempotency must last beyond the finite FIFO deduplication window. FIFO preserves arrival order, not global business ordering. Separate event items can reach different stream shards; consumers must handle out-of-order domain versions.
+FIFO destinations require a `messageGroupId` function. Bridges hash stream ID and sequence for ordered-event deduplication, or event ID for independent facts, but destination idempotency must last beyond the finite FIFO deduplication window. FIFO preserves arrival order, not global business ordering. The ordered publisher instead commits a per-stream head, and ordered subscribers reconstruct business order from the retained log even when regional notifications arrive out of order.
 
 Webhooks require HTTPS, reject URL credentials and redirects, default to a ten-second timeout, and reject non-2xx responses. `x-event-id` is the URI-encoded event ID. Inject authorization headers through your secret management process. Receiver-side authentication and idempotency remain application responsibilities.
 
@@ -72,4 +78,4 @@ Deploy [workers.yaml](../cloudformation/workers.yaml) using [the wakeup guide](w
 
 Delivery is at least once. Both regional routers can see the same event. Use a globally coordinated receipt or an idempotent destination for the same logical effect across Regions; a receipt written before a nontransactional effect can lose it, while a receipt written afterward can repeat it. The package does not claim exactly-once delivery.
 
-Streams retain records for 24 hours. Table retention does not automatically replay historical events; use inspected archive replay or an application-owned event replay operation within your retention window. Tombstones prevent ID reuse until expiry. See [AWS acceptance testing](event-testing.md).
+Streams retain records for 24 hours. Table retention does not automatically replay historical events; use inspected archive replay or an application-owned event replay operation within your retention window. Unordered-event tombstones prevent ID reuse until expiry; ordered logs and subscriber cursors do not expire automatically. See [AWS acceptance testing](event-testing.md).

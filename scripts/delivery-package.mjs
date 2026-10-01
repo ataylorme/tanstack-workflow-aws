@@ -50,6 +50,9 @@ createWebhookBridge({ url: 'https://example.test' })
 const { createApplicationQueueHandler, createWorkflowStreamRouter, createWorkflowWorker } = await import('@ataylorme/tanstack-workflow-aws/wakeups')
 const { publishWorkflowEvent, continueAsNew } = await import('@ataylorme/tanstack-workflow-aws/workflow-effects')
 const { nextScheduleTime } = await import('@ataylorme/tanstack-workflow-aws/schedules')
+const { createDynamoOrderedSubscriber, createDynamoOrderedEventPublisher } = await import('@ataylorme/tanstack-workflow-aws/ordered-events')
+if (typeof createDynamoOrderedSubscriber({ tableName: 'test', subscriberId: 'test', handler: async () => {} }).handler !== 'function') throw new Error('Invalid ordered subscriber export')
+if (typeof createDynamoOrderedEventPublisher({ tableName: 'test' }).read !== 'function') throw new Error('Invalid ordered publisher export')
 if ([createWorkflowStreamRouter, createWorkflowWorker, publishWorkflowEvent, continueAsNew].some(fn => typeof fn !== 'function')) throw new Error('Missing orchestration exports')
 if (nextScheduleTime({ kind: 'interval', everyMs: 100 }, 100) !== 200) throw new Error('Invalid schedule export')
 if ((await createApplicationQueueHandler(() => {})({ Records: [] })).batchItemFailures.length) throw new Error('Invalid application queue export')
@@ -96,6 +99,9 @@ const transport: WakeupIO = { read: async () => undefined, enqueue: async () => 
 const router: DynamoDBStreamHandler = createWorkflowStreamRouter({ transport, publishApplicationEvent: async () => {} })
 const worker: SQSHandler = createWorkflowWorker({ store: createDynamoWorkflowExecutionStore({ tableName: 'test' }), runtime, transport, publisher, region: 'test' })
 const application: SQSHandler = createApplicationQueueHandler(async () => {})
+import { createDynamoOrderedSubscriber } from '@ataylorme/tanstack-workflow-aws/ordered-events'
+const ordered: SQSHandler = createDynamoOrderedSubscriber({ tableName: 'test', subscriberId: 'test', handler: async (event, delivery) => { const sequence: number = event.ordering.sequence; const key: string = delivery.idempotencyKey; void sequence; void key } }).handler
+void ordered
 void store; void handler; void typedPayload; void typedTarget; void router; void worker; void application
 `)
   execFileSync(join(root, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--exactOptionalPropertyTypes', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', '--target', 'ES2022', '--skipLibCheck', 'consumer.mts'], {

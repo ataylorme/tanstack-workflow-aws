@@ -1,3 +1,4 @@
+import { applicationEventGroupId, applicationEventDeduplicationId } from './event-identity.js'
 import { createHash } from 'node:crypto'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
@@ -71,10 +72,11 @@ export function createAwsWorkflowTransport(config: WakeupConfig): WakeupIO {
 }
 
 
-export function createApplicationQueuePublisher(options: { queueUrl: string; client?: SQSClient }) {
+export function createApplicationQueuePublisher(options: { queueUrl: string; client?: SQSClient; fifo?: boolean }) {
   const client = options.client ?? new SQSClient({ maxAttempts: 3,
     requestHandler: { connectionTimeout: 1000, requestTimeout: 4000, throwOnRequestTimeout: true } })
   return async (event: ApplicationEvent) => {
-    await client.send(new SendMessageCommand({ QueueUrl: options.queueUrl, MessageBody: serializeApplicationEvent(event) }))
+    await client.send(new SendMessageCommand({ QueueUrl: options.queueUrl, MessageBody: serializeApplicationEvent(event),
+      ...((options.fifo ?? options.queueUrl.endsWith('.fifo')) ? { MessageGroupId: applicationEventGroupId(event), MessageDeduplicationId: applicationEventDeduplicationId(event) } : {}) }))
   }
 }

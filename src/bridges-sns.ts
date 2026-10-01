@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { applicationEventDeduplicationId } from './event-identity.js'
 import { serializeApplicationEvent } from './event-validation.js'
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns'
 import type { ApplicationEvent, ApplicationEventHandler } from './events.js'
@@ -18,8 +18,8 @@ export function createSnsBridge(options: SnsBridgeOptions): ApplicationEventHand
     await client.send(new PublishCommand({
       TopicArn: options.topicArn,
       Message: serializeApplicationEvent(event),
-      MessageAttributes: { eventType: { DataType: 'String', StringValue: event.type } },
-      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: createHash('sha256').update(event.id).digest('hex') } : {}),
+      MessageAttributes: { eventType: { DataType: 'String', StringValue: event.type }, ordered: { DataType: 'String', StringValue: event.ordering ? 'true' : 'false' } },
+      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: applicationEventDeduplicationId(event) } : {}),
     }))
   }
 }

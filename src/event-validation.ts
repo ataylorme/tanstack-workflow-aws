@@ -33,6 +33,11 @@ export function serializeApplicationEvent(event: ApplicationEvent): string {
   if (typeof event.timestamp !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(event.timestamp) || !Number.isFinite(Date.parse(event.timestamp))) {
     throw new TypeError('timestamp must be an ISO 8601 timestamp')
   }
+  if (event.ordering !== undefined) {
+    if (!event.ordering || typeof event.ordering !== 'object') throw new TypeError('Invalid ordering')
+    text(event.ordering.streamId, 'ordering.streamId')
+    if (!Number.isSafeInteger(event.ordering.sequence) || event.ordering.sequence < 1) throw new TypeError('ordering.sequence must be a positive safe integer')
+  }
   if (event.correlationId !== undefined) text(event.correlationId, 'correlationId')
   if (event.causationId !== undefined) text(event.causationId, 'causationId')
   if (event.metadata !== undefined) {
@@ -47,7 +52,7 @@ export function serializeApplicationEvent(event: ApplicationEvent): string {
   // Undefined optional envelope fields are intentionally omitted; undefined data is rejected above.
   const encoded = JSON.stringify({
     id: event.id, type: event.type, version: event.version, timestamp: event.timestamp, data: event.data,
-    correlationId: event.correlationId, causationId: event.causationId, metadata: event.metadata,
+    ordering: event.ordering ? { streamId: event.ordering.streamId, sequence: event.ordering.sequence } : undefined, correlationId: event.correlationId, causationId: event.causationId, metadata: event.metadata,
   })
   if (Buffer.byteLength(encoded, 'utf8') > MAX_APPLICATION_EVENT_BYTES) throw new TypeError('Application event exceeds 240 KiB; store large payloads externally')
   return encoded

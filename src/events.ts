@@ -1,3 +1,4 @@
+import { createDynamoOrderedEventPublisher, type EventOrdering } from './ordered-events.js'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { setTimeout } from 'node:timers/promises'
@@ -13,6 +14,7 @@ export interface ApplicationEvent<T = unknown> {
   data: T
   correlationId?: string
   causationId?: string
+  ordering?: EventOrdering
   metadata?: Record<string, string>
 }
 
@@ -24,6 +26,7 @@ export interface PublishApplicationEventOptions<T> {
   data: T
   correlationId?: string
   causationId?: string
+  ordering?: EventOrdering
   metadata?: Record<string, string>
 }
 
@@ -31,6 +34,8 @@ export interface DynamoApplicationEventPublisherOptions {
   tableName: string
   client?: DynamoDBDocumentClient
   retentionMs?: number
+  orderedEventTypes?: readonly string[]
+  maxOrderedEvents?: number
 }
 
 export interface ApplicationEventPublisher {
@@ -56,8 +61,10 @@ export function createDynamoApplicationEventPublisher(
 
   if (!TableName) throw new Error('tableName is required')
 
+  const ordered = createDynamoOrderedEventPublisher({ ...options, client, eventTypes: options.orderedEventTypes, maxEvents: options.maxOrderedEvents })
   return {
     async publish<T>(input: PublishApplicationEventOptions<T>): Promise<ApplicationEvent<T>> {
+      if (input.ordering) return ordered.publish(input)
       const event: ApplicationEvent<T> = {
         id: input.id ?? randomUUID(),
         type: input.type,

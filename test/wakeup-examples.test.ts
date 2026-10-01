@@ -16,3 +16,13 @@ it('plans reconciliation without accessing AWS', () => {
   expect(run([])).toContain('Plan only')
   expect(() => run(['--execute'])).toThrow('Explicit AWS_PROFILE required')
 })
+
+it('provides FIFO application fanout and an ordered subscriber with a shared identity', () => {
+  expect(workers.match(/FifoQueue: true/g)).toHaveLength(2)
+  expect(workers).toContain('FifoTopic: true')
+  const subscriber = readFileSync('cloudformation/ordered-subscriber.yaml', 'utf8')
+  expect(subscriber).toContain('RawMessageDelivery: true')
+  expect(subscriber).toContain('SUBSCRIBER_ID: !Ref SubscriberId')
+  expect(subscriber).toContain('ordered_delivery_blocked')
+  expect(subscriber).toContain('Handler: ordered-subscriber.handler')
+})

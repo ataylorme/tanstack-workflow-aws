@@ -14,7 +14,7 @@ npm pack --pack-destination /path/to/shared-artifacts
 
 Provision the MRSC table and regional [workers stacks](workflow-wakeups.md). Verify `STRONG` consistency, active east/west replicas and the Ohio witness. Each regional stream must use `NEW_AND_OLD_IMAGES` and exactly one enabled router mapping. Confirm its filter, `ReportBatchItemFailures`, retry limits and S3 failure destination. Confirm both SQS mappings are enabled.
 
-Create a dedicated standard SQS test queue and subscribe it to the application SNS topic with **raw message delivery enabled** and a queue policy allowing that topic. The smoke runner must read this observation queue, not the application work queue competing with its Lambda consumer. Cross-account or customer-managed encryption requires additional policies. Do not use a business queue for the test.
+Create a dedicated FIFO SQS test queue and subscribe it to the application SNS topic with **raw message delivery enabled** and a queue policy allowing that topic. The smoke runner must read this observation queue, not the application work queue competing with its Lambda consumer. Cross-account or customer-managed encryption requires additional policies. Do not use a business queue for the test.
 
 The application owns authenticated endpoints, payload schemas, stable operation IDs, state-to-event handoff and consumer idempotency. Publishing acknowledges durable DynamoDB storage; verify downstream delivery separately. The workflow outbox should be tested through a workflow using `publishWorkflowEvent`, as well as the direct publisher below.
 
@@ -43,9 +43,10 @@ Use dedicated resources and bounded fault injection. Record IDs, expected outcom
 2. Deny the router's application queue send permission. Require partial stream failure, routing alarm and eventual full batch archive. Restore access and replay an inspected archived batch to the private router.
 3. Deny the application worker's SNS permission. Require application delivery failure logs, retries and the application DLQ while independent workflow messages still progress. Restore access and redrive the inspected messages.
 4. Crash after an outbox publication but before cursor acknowledgement. Retry and verify one event item with the same ID and eventual cursor progress. Repeat concurrent drains in both Regions.
-5. Invoke the same consumer message twice and deliver events out of order. Verify the application's idempotency and domain-version checks.
+5. Publish the four task positions, deliver sequence 4 first and repeat notifications in both Regions using the same subscriber ID. The ordered handler must observe exactly requested, approved, started, completed. Hold one handler open and verify the opposite Region cannot enter that or a later position.
 6. Exercise a slow handler and unavailable failure archive. Verify timeout guards, `IteratorAge`, queue age and `DestinationDeliveryFailures`; a failed archive write is not successful recovery.
-7. Exercise cleanup after the configured retention boundary and confirm payload deletion, tombstone rejection of late retries, and eventual tombstone expiry.
+7. Crash after the ordered effect but before cursor acknowledgement. Verify later sequences remain blocked even after Lambda timeout and queue redrive. Resolve only after confirming the effect and stopping the original execution; then verify ordered progress resumes.
+8. Exercise cleanup after the configured retention boundary and confirm payload deletion, tombstone rejection of late retries, and eventual tombstone expiry.
 
 S3 archive objects contain the original Lambda batch in their payload. Inspect a specific object, parse it to a local JSON batch, correct the fault and invoke the private router. Check invocation errors and `batchItemFailures` before considering replay complete. Application queue redrive and stream archive replay are separate recovery operations.
 

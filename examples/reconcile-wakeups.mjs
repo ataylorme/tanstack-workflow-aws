@@ -39,7 +39,7 @@ try {
     const page = aws(['dynamodb', 'scan', '--table-name', tableName, '--consistent-read',
       '--projection-expression', 'PK, SK', '--filter-expression', 'SK = :meta',
       '--expression-attribute-values', JSON.stringify({ ':meta': { S: 'META' } }), '--limit', '100', '--no-paginate', ...(cursor ? ['--exclusive-start-key', JSON.stringify(cursor)] : [])])
-    const keys = page.Items.map(item => ({ PK: item.PK.S, SK: item.SK.S }))
+    const keys = page.Items.map(item => ({ PK: item.PK.S, SK: item.SK.S })).filter(item => /^(RUN|TIMER|SCHEDULE|EVENT)#/.test(item.PK))
     for (let i = 0; i < keys.length; i += 10) {
       const batch = keys.slice(i, i + 10)
       const responseFile = resolve(dir, 'response.json')

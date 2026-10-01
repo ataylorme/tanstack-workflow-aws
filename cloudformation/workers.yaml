@@ -377,16 +377,39 @@ Resources:
       TreatMissingData: notBreaching
   ApplicationDLQ:
     Type: AWS::SQS::Queue
-    Properties: { SqsManagedSseEnabled: true, MessageRetentionPeriod: 1209600 }
+    Properties:
+      QueueName: !Join ['', ['application-dlq-', !Select [2, !Split ['/', !Ref 'AWS::StackId']], '.fifo']]
+      FifoQueue: true
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
   ApplicationQueue:
     Type: AWS::SQS::Queue
     Properties:
+      QueueName: !Join ['', ['application-', !Select [2, !Split ['/', !Ref 'AWS::StackId']], '.fifo']]
+      FifoQueue: true
+      ContentBasedDeduplication: false
       SqsManagedSseEnabled: true
       VisibilityTimeout: 360
       MessageRetentionPeriod: 1209600
       RedrivePolicy: { deadLetterTargetArn: !GetAtt ApplicationDLQ.Arn, maxReceiveCount: 8 }
   ApplicationTopic:
     Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Join ['', ['application-', !Select [2, !Split ['/', !Ref 'AWS::StackId']], '.fifo']]
+      FifoTopic: true
+      ContentBasedDeduplication: false
+  ApplicationTopicFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SNS
+      MetricName: NumberOfNotificationsFailed
+      Dimensions: [{ Name: TopicName, Value: !GetAtt ApplicationTopic.TopicName }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
   ApplicationRole:
     Type: AWS::IAM::Role
     Properties:

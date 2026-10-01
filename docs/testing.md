@@ -8,7 +8,7 @@ npm run typecheck
 npm run build
 DYNAMODB_LOCAL_JAR=/path/to/DynamoDBLocal.jar npm run test:integration
 npm run test:package
-npx --no-install esbuild examples/handler.ts examples/router.ts examples/worker.ts examples/application-consumer.ts \
+npx --no-install esbuild examples/handler.ts examples/router.ts examples/worker.ts examples/application-consumer.ts examples/ordered-subscriber.ts \
   --bundle --platform=node --target=node22 --format=cjs --outdir=build/ci
 cfn-lint cloudformation/*.yaml
 ```
@@ -26,6 +26,7 @@ Deploy an isolated MRSC table and worker stacks with bounded workloads. Keep imm
 | Scenario | Required evidence |
 | --- | --- |
 | Topology | Exactly one stream mapping per replica and two independent processing queues |
+| Ordered subscribers | Reversed/duplicate regional notifications produce ascending callbacks; uncertain effects block later positions until resolved |
 | Concurrent claims | One conditional owner for each run, timer or bucket; duplicate external delivery handled idempotently |
 | Interrupted execution | Other-region recovery after queued creation, accepted signal/approval, persisted timer wait and schedule claim |
 | Self-advancing schedules | Several consecutive ticks without another materialization call; missed ticks obey each policy |

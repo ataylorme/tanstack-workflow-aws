@@ -19,7 +19,7 @@ This packs the package, installs the tarball into an unrelated temporary project
 
 ## Regional deployment artifacts
 
-Bundle `handler.js`, `worker.js`, `router.js` and `application-consumer.js` using the commands in [demand-driven wakeups](workflow-wakeups.md). Deploy `workers.yaml` per replica. `regional.yaml` supplies the optional standalone HTTP API. The AWS transport subpath requires Scheduler and SQS peers; the example application consumer also requires SNS.
+Bundle `handler.js`, `worker.js`, `router.js` and `application-consumer.js` and `ordered-subscriber.js` using the commands in [demand-driven wakeups](workflow-wakeups.md). Deploy `workers.yaml` per replica. `regional.yaml` supplies the optional standalone HTTP API. The AWS transport subpath requires Scheduler and SQS peers; the example application consumer also requires SNS.
 
 Use immutable S3 artifact keys or explicit object versions. CloudFormation does not detect overwritten bytes at the same bucket/key. Web and worker bundles must contain the same workflow registry and matching engine. The edge template's `RouterRevision` identifies its inline routing code; published versions are retained until CloudFront replication permits their removal.
 

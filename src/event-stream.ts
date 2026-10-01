@@ -7,13 +7,23 @@ import { serializeApplicationEvent } from './event-validation.js'
 export interface ApplicationStreamRecord {
   eventID?: string | undefined
   eventName?: string | undefined
-  dynamodb?: { SequenceNumber?: string | undefined; NewImage?: Record<string, unknown> | undefined } | undefined
+  dynamodb?: { SequenceNumber?: string | undefined; NewImage?: Record<string, unknown> | undefined; OldImage?: Record<string, unknown> | undefined } | undefined
 }
 
-/** Ignore non-inserts and unrelated item types; reject malformed application items. */
+/** Decode immutable event inserts and committed ordered-head changes; never staged slots. */
 export function decodeApplicationEvent(record: ApplicationStreamRecord): ApplicationEvent | undefined {
-  if (record.eventName !== 'INSERT' || !record.dynamodb?.NewImage) return undefined
+  if (!['INSERT', 'MODIFY'].includes(record.eventName ?? '') || !record.dynamodb?.NewImage) return undefined
   const image = record.dynamodb.NewImage
+  if ((image.entityType as { S?: string } | undefined)?.S === 'ORDERED_STREAM') {
+    const item = unmarshall(image as Record<string, AttributeValue>)
+    if (item.schemaVersion !== 1) throw new Error('Unsupported ordered stream storage version')
+    const old = record.dynamodb.OldImage ? unmarshall(record.dynamodb.OldImage as Record<string, AttributeValue>) : undefined
+    if (!item.committed || item.committed === old?.committed) return undefined
+    serializeApplicationEvent(item.event)
+    if (item.event.ordering?.streamId !== item.streamId || item.event.ordering.sequence !== item.committed) throw new Error('Invalid ordered head notification')
+    return item.event as ApplicationEvent
+  }
+  if (record.eventName !== 'INSERT') return undefined
   if ((image.entityType as { S?: string } | undefined)?.S !== 'APPLICATION_EVENT') return undefined
   const item = unmarshall(image as Record<string, AttributeValue>)
   serializeApplicationEvent(item.event)

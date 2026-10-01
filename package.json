@@ -56,6 +56,10 @@
     "./schedules": {
       "types": "./dist/schedules.d.ts",
       "import": "./dist/schedules.js"
+    },
+    "./ordered-events": {
+      "types": "./dist/ordered-events.d.ts",
+      "import": "./dist/ordered-events.js"
     }
   },
   "files": [
