@@ -3,7 +3,7 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
 import { SchedulerClient } from '@aws-sdk/client-scheduler'
 import { SQSClient } from '@aws-sdk/client-sqs'
 import type { DynamoDBStreamEvent } from 'aws-lambda'
-import { createWakeupIO, dispatchKey, dueKinds, dueWakeup, parseKey, parseWakeup, processWakeup, scheduleInput, type DueWakeup, type WakeupIO } from '../examples/wakeups.js'
+import { createWakeupIO, dispatchKey, dueKinds, dueWakeup, parseKey, parseWakeup, processWakeup, scheduleInput, workTarget, type DueWakeup, type WakeupIO } from '../examples/wakeups.js'
 import { dispatchStream } from '../examples/dispatcher.js'
 
 const key = { PK: 'RUN#fixture', SK: 'META' }
@@ -65,30 +65,66 @@ describe('durable wakeup contracts', () => {
   })
   it('defers stale deliveries until the current lease expires', async () => {
     const services = io(item({ run: { status: 'running', lease: { expiresAt: 1000 } } }))
-    const sweep = vi.fn()
-    await processWakeup(wakeup, services, sweep, () => 200)
-    expect(sweep).not.toHaveBeenCalled()
+    const handlers = { processTarget: vi.fn(), sweepLegacy: vi.fn() }
+    await processWakeup(wakeup, services, handlers, () => 200)
+    expect(handlers.processTarget).not.toHaveBeenCalled()
+    expect(handlers.sweepLegacy).not.toHaveBeenCalled()
     expect(services.schedule).toHaveBeenCalledWith({ ...wakeup, dueAt: 1000 }, 1000)
   })
-  it('does not treat an empty index sweep as authoritative completion', async () => {
+  it('processes only the named target and persists a successor for unresolved work', async () => {
     const services = io()
-    await processWakeup(wakeup, services, vi.fn().mockResolvedValue({ remainingMayExist: false }), () => 200)
+    const handlers = { processTarget: vi.fn(), sweepLegacy: vi.fn() }
+    await processWakeup(wakeup, services, handlers, () => 200)
+    expect(handlers.processTarget).toHaveBeenCalledExactlyOnceWith({ kind: 'run', runId: 'fixture' })
+    expect(handlers.sweepLegacy).not.toHaveBeenCalled()
+    expect(services.enqueue).not.toHaveBeenCalled()
     expect(services.read).toHaveBeenCalledTimes(2)
-    expect(services.schedule).toHaveBeenCalledWith(wakeup, 60_200)
+    expect(services.schedule).toHaveBeenCalledWith(wakeup, 1200)
   })
-  it('continues bounded batches and acknowledges only after successor persistence', async () => {
+  it('continues old drain batches without making new keyed work use discovery', async () => {
     const services = io()
-    await processWakeup({ version: 1, kind: 'drain' }, services, vi.fn().mockResolvedValue({ remainingMayExist: true }), () => 200)
+    const handlers = { processTarget: vi.fn(), sweepLegacy: vi.fn().mockResolvedValue({ remainingMayExist: true }) }
+    await processWakeup({ version: 1, kind: 'drain' }, services, handlers, () => 200)
     expect(services.enqueue).toHaveBeenCalledWith({ version: 1, kind: 'drain' }, 1)
-    vi.mocked(services.schedule).mockRejectedValue(new Error('scheduler unavailable'))
-    await expect(processWakeup(wakeup, services, vi.fn().mockResolvedValue({ remainingMayExist: true }), () => 200)).rejects.toThrow('scheduler unavailable')
+    expect(handlers.processTarget).not.toHaveBeenCalled()
+    expect(services.read).not.toHaveBeenCalled()
   })
-  it('does not reschedule completed work after a successful sweep', async () => {
+  it('does not acknowledge until the targeted successor is durable', async () => {
     const services = io()
-    vi.mocked(services.read).mockResolvedValueOnce(item()).mockResolvedValueOnce(undefined)
-    await processWakeup(wakeup, services, vi.fn().mockResolvedValue({ remainingMayExist: false }), () => 200)
+    vi.mocked(services.schedule).mockRejectedValue(new Error('scheduler unavailable'))
+    await expect(processWakeup(wakeup, services, { processTarget: vi.fn(), sweepLegacy: vi.fn() }, () => 200)).rejects.toThrow('scheduler unavailable')
+  })
+  it('does not acknowledge failed execution or the post-execution authoritative read', async () => {
+    const services = io()
+    await expect(processWakeup(wakeup, services, { processTarget: vi.fn().mockRejectedValue(new Error('claim failed')), sweepLegacy: vi.fn() })).rejects.toThrow('claim failed')
+    vi.mocked(services.read).mockResolvedValueOnce(item()).mockRejectedValueOnce(new Error('read failed'))
+    await expect(processWakeup(wakeup, services, { processTarget: vi.fn(), sweepLegacy: vi.fn() })).rejects.toThrow('read failed')
+  })
+  it('uses the current category and carries a subsequent category change into the successor', async () => {
+    const services = io()
+    vi.mocked(services.read).mockResolvedValueOnce(item({ duePK: 'TIMER_RUN' })).mockResolvedValueOnce(item({ dueSK: 5000 }))
+    const handlers = { processTarget: vi.fn(), sweepLegacy: vi.fn() }
+    await processWakeup(wakeup, services, handlers, () => 200)
+    expect(handlers.processTarget).toHaveBeenCalledExactlyOnceWith({ kind: 'timer', runId: 'fixture' })
+    expect(services.schedule).toHaveBeenCalledWith({ ...wakeup, dueAt: 5000 }, 5000)
+    expect(handlers.sweepLegacy).not.toHaveBeenCalled()
+  })
+  it('does not reschedule completed work or execute obsolete wakeups', async () => {
+    const services = io()
+    vi.mocked(services.read).mockResolvedValueOnce(item()).mockResolvedValue(undefined)
+    const handlers = { processTarget: vi.fn(), sweepLegacy: vi.fn() }
+    await processWakeup(wakeup, services, handlers, () => 200)
+    await processWakeup(wakeup, services, handlers, () => 200)
+    expect(handlers.processTarget).toHaveBeenCalledTimes(1)
     expect(services.schedule).not.toHaveBeenCalled()
   })
+  it('maps schedule and encoded standalone timer keys without confusing IDs', () => {
+    expect(workTarget({ ...wakeup, dueKind: 'SCHEDULE', key: { PK: 'SCHEDULE#daily#1', SK: 'META' } })).toEqual({ kind: 'schedule', scheduleId: 'daily#1' })
+    expect(workTarget({ ...wakeup, dueKind: 'TIMER', key: { PK: 'TIMER#run%23x#timer%3Ax%23y', SK: 'META' } })).toEqual({ kind: 'timer', runId: 'run#x', signalId: 'timer:x#y' })
+    expect(() => workTarget({ ...wakeup, dueKind: 'SCHEDULE' })).toThrow('does not match')
+    expect(() => workTarget({ ...wakeup, dueKind: 'TIMER', key: { PK: 'TIMER#a#b#c', SK: 'META' } })).toThrow('does not match')
+  })
+
 })
 
 describe('scheduler adapter', () => {

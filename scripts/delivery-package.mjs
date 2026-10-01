@@ -21,12 +21,24 @@ try {
   }
   writeFileSync(join(temporary, 'consumer.mjs'), `
 import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
+const { GetCommand } = await import('@aws-sdk/lib-dynamodb')
 const { createWorkflow } = await import('@ataylorme/tanstack-workflow-aws/workflow')
 const { defineWorkflowRuntime } = await import('@ataylorme/tanstack-workflow-aws/runtime')
 if (typeof createWorkflow !== 'function' || typeof defineWorkflowRuntime !== 'function') throw new Error('Missing pinned runtime exports')
 const store = createDynamoWorkflowExecutionStore({ tableName: 'consumer-smoke' })
 if (typeof store.withLeaseOwner !== 'function' || typeof store.appendEvents !== 'function') {
   throw new Error('Published entry point does not expose the store')
+}
+const targetedStore = createDynamoWorkflowExecutionStore({ tableName: 'consumer-targeted', client: {
+  send: async command => {
+    if (!(command instanceof GetCommand) || command.input.ConsistentRead !== true) throw new Error('Targeted processing attempted discovery')
+    return {}
+  },
+} })
+const runtime = defineWorkflowRuntime({ store: targetedStore, workflows: {} })
+for (const target of [{ kind: 'run', runId: 'missing' }, { kind: 'timer', runId: 'missing' }, { kind: 'timer', runId: 'missing', signalId: 'timer' }, { kind: 'schedule', scheduleId: 'missing' }]) {
+  const result = await runtime.processTarget({ target })
+  if (result.recovered.length + result.timers.length + result.scheduled.length !== 0 || 'remainingMayExist' in result) throw new Error('Invalid targeted result')
 }
 const { createDynamoApplicationEventPublisher } = await import('@ataylorme/tanstack-workflow-aws/events')
 const { createApplicationStreamHandler } = await import('@ataylorme/tanstack-workflow-aws/event-stream')
@@ -52,7 +64,7 @@ console.log('Packed core, events, stream, and webhook imports passed without opt
   execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '@types/aws-lambda@' + manifest.devDependencies['@types/aws-lambda']], { cwd: temporary, stdio: 'inherit' })
   writeFileSync(join(temporary, 'consumer.mts'), `
 import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
-import type { WorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws/runtime'
+import { defineWorkflowRuntime, type WorkflowExecutionStore, type WorkflowWorkTarget, type WorkflowRuntimeProcessTargetResult } from '@ataylorme/tanstack-workflow-aws/runtime'
 const store: WorkflowExecutionStore = createDynamoWorkflowExecutionStore({ tableName: 'consumer-smoke' })
 import { createDynamoApplicationEventPublisher } from '@ataylorme/tanstack-workflow-aws/events'
 import { createApplicationStreamHandler } from '@ataylorme/tanstack-workflow-aws/event-stream'
@@ -64,7 +76,11 @@ async function typedPayload() {
   const value: number = result.data.value
   return value
 }
-void store; void handler; void typedPayload
+const runtime = defineWorkflowRuntime({ store, workflows: {} })
+async function typedTarget(target: WorkflowWorkTarget): Promise<WorkflowRuntimeProcessTargetResult> {
+  return runtime.processTarget({ target, leaseOwner: 'consumer', maxDurationMs: 1000 })
+}
+void store; void handler; void typedPayload; void typedTarget
 `)
   execFileSync(join(root, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--exactOptionalPropertyTypes', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', '--target', 'ES2022', '--skipLibCheck', 'consumer.mts'], {
     cwd: temporary, stdio: 'inherit',

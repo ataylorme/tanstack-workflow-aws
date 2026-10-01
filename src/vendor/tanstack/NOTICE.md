@@ -10,7 +10,10 @@ specifier rewrites: relative imports/exports include `.js` (directory imports
 include `/index.js`), and `@tanstack/workflow-core` resolves to the vendored core.
 Host safety patches persist terminal input-validation/version-mismatch states,
 isolate per-run sweep failures, and add an optional `deferRunRecovery` store hook
-for bounded retry backoff. These changes are covered by runtime recovery tests.
+for bounded retry backoff. The host `processTarget` runtime extension and optional
+`claimStaleRun`, `claimTimer`, and `claimScheduleBucket` store methods reuse the
+execution/recovery driver for one named item without discovery. Legacy `sweep`
+remains supported. These changes are covered by runtime recovery tests.
 Preserve this notice and the license
 when updating the snapshot. This snapshot is used because the published packages
 at review time did not provide the interrupted-run recovery required by this store.

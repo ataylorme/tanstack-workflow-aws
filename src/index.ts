@@ -11,7 +11,7 @@ import type {
   WorkflowExecutionStore, WorkflowExecution, StoredWorkflowEvent, WorkflowLease,
   AppendEventsArgs, ReadEventsArgs, ClaimRunArgs, ClaimRunResult, DeliverSignalArgs,
   DeliverSignalResult, DeliverApprovalArgs, DeliverApprovalResult, ScheduleBucket,
-  RunSummary, UpsertScheduleArgs, ScheduleTimerArgs,
+  RunSummary, UpsertScheduleArgs, ScheduleTimerArgs, ClaimTargetArgs,
 } from './runtime.js'
 
 export interface DynamoWorkflowStoreOptions {
@@ -20,8 +20,9 @@ export interface DynamoWorkflowStoreOptions {
   client?: DynamoDBDocumentClient
 }
 
-/** Bind every runtime call to the lease owner passed to startRun/sweep. Required for fencing state/event writes. */
-export type FencedWorkflowExecutionStore = WorkflowExecutionStore & {
+/** Bind every runtime call to the lease owner passed to startRun/processTarget/sweep. Required for fencing state/event writes. */
+export type FencedWorkflowExecutionStore = WorkflowExecutionStore & Required<Pick<WorkflowExecutionStore,
+  'claimStaleRun' | 'claimTimer' | 'claimScheduleBucket'>> & {
   withLeaseOwner<T>(owner: string, run: () => Promise<T>): Promise<T>
 }
 
@@ -150,7 +151,99 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
     }
     throw new Error(`Delivery contention retry limit: ${runId}`)
   }
+  async function claimRunTimerItem(item: Item, args: ClaimTargetArgs) {
+    const run = item.run as WorkflowExecution
+    const wait = run?.waitingFor
+    if (item.deleted || run?.status !== 'paused' || wait?.signalName !== '__timer' || typeof wait.deadline !== 'number' || wait.deadline > args.now) return undefined
+    if (item.timerLease?.expiresAt > args.now) return undefined
+    const signalId = `timer:${run.runId}:${wait.stepId}:${wait.deadline}`
+    try {
+      await replace(item, { timerLease: lease(args.leaseOwner, args.leaseMs, args.now) })
+      return { runId: run.runId, workflowId: run.workflowId, workflowVersion: run.workflowVersion, wakeAt: wait.deadline, signalId }
+    } catch (error) { if (isConflict(error)) return undefined; throw error }
+  }
+  async function claimTimerItem(item: Item, args: ClaimTargetArgs) {
+    if (typeof item.wakeAt !== 'number' || item.wakeAt > args.now || !item.duePK) return undefined
+    const current = await get(runKey(item.runId))
+    // Real runtime waits are covered by TIMER_RUN. Remove orphan/completed/delivered timers.
+    if (!current || current.deleted || terminal(current.run.status) || current.pending || current.state) {
+      await remove(item.PK)
+      return undefined
+    }
+    if (item.lease?.expiresAt > args.now) return undefined
+    try { await replace(item, { lease: lease(args.leaseOwner, args.leaseMs, args.now) }); return { runId: item.runId, workflowId: item.workflowId, workflowVersion: item.workflowVersion, wakeAt: item.wakeAt, signalId: item.signalId } }
+    catch (error) { if (isConflict(error)) return undefined; throw error }
+  }
+  async function claimScheduleItem(schedule: Item, args: ClaimTargetArgs) {
+    const pending = schedule.pendingBucket
+    if (pending) {
+      if (pending.lease.expiresAt > args.now) return undefined
+      const nextBucket = { ...pending, lease: lease(args.leaseOwner, args.leaseMs, args.now) }
+      try {
+        await replace(schedule, { pendingBucket: nextBucket, ...scheduleDueFields({ ...schedule, pendingBucket: nextBucket }) })
+        return nextBucket as ScheduleBucket
+      } catch (error) { if (isConflict(error)) return undefined; throw error }
+    }
+    if (!schedule.enabled || typeof schedule.nextFireAt !== 'number' || !Number.isFinite(schedule.nextFireAt) || schedule.nextFireAt > args.now ||
+        (schedule.lastStartedAt !== undefined && schedule.nextFireAt <= schedule.lastStartedAt)) return undefined
+    if (!['skip', 'allow'].includes(schedule.overlapPolicy)) throw new Error(`Unsupported schedule overlap policy: ${schedule.overlapPolicy}`)
+    if (schedule.overlapPolicy === 'skip' && schedule.activeRunId) {
+      const active = await store.loadRun(schedule.activeRunId)
+      if (active && !terminal(active.status)) {
+        // Consume this tick atomically. A concurrent schedule update forces fresh evaluation.
+        const next = { ...schedule, lastStartedAt: schedule.nextFireAt }
+        try { await replace(schedule, { lastStartedAt: next.lastStartedAt, ...scheduleDueFields(next) }) }
+        catch (error) { if (!isConflict(error)) throw error }
+        return undefined
+      }
+    }
+    const bucketId = String(schedule.nextFireAt)
+    const bucket = { scheduleId: schedule.scheduleId, bucketId, workflowId: schedule.workflowId, workflowVersion: schedule.workflowVersion,
+      runId: `${schedule.workflowId}:${schedule.scheduleId}:${bucketId}`, fireAt: schedule.nextFireAt, input: schedule.input,
+      overlapPolicy: schedule.overlapPolicy, lease: lease(args.leaseOwner, args.leaseMs, args.now) }
+    try {
+      await replace(schedule, { pendingBucket: bucket, ...scheduleDueFields({ ...schedule, pendingBucket: bucket }) })
+      return bucket as ScheduleBucket
+    } catch (error) { if (isConflict(error)) return undefined; throw error }
+  }
+  async function claimStaleRunItem(item: Item, args: ClaimTargetArgs) {
+    if (item.deleted || !['queued', 'running'].includes(item.run.status) || (item.run.lease && item.run.lease.expiresAt > args.now)) return undefined
+    const next = { ...item.run, status: 'running', lease: lease(args.leaseOwner, args.leaseMs, args.now), updatedAt: args.now }
+    let claimed: Item
+    try { claimed = await replace(item, { run: next, ...dueFields(next) }) }
+    catch (error) { if (isConflict(error)) return undefined; throw error }
+    try { if (claimed.pending) {
+      await store.withLeaseOwner(args.leaseOwner, async () => {
+        if (!claimed.state) throw new Error('Pending delivery has no durable run state')
+        const history = await readEvents({ runId: next.runId })
+        const seed = buildPendingResolution(claimed.pending, claimed.state, history.map(event => event.event))
+        if (seed) await store.appendEvents({ runId: next.runId, expectedNextIndex: history.length, events: [seed] })
+        else await mutate(item.PK, current => { fence(current); return { pending: undefined } })
+      })
+    }
+    } catch (error) {
+      await store.deferRunRecovery!({ runId: next.runId, leaseOwner: args.leaseOwner, now: args.now, error })
+      return undefined
+    }
+    return { run: next, lease: next.lease }
+  }
   const store: FencedWorkflowExecutionStore = {
+    async claimStaleRun(args) {
+      const item = await get(runKey(args.runId))
+      return item && item.duePK === 'RUNNING' && item.dueSK <= args.now
+        ? claimStaleRunItem(item, args) : undefined
+    },
+    async claimTimer(args) {
+      const standalone = args.signalId !== undefined
+      const item = await get(standalone ? timerKey(args.runId, args.signalId!) : runKey(args.runId))
+      if (!item || item.duePK !== (standalone ? 'TIMER' : 'TIMER_RUN') || item.dueSK > args.now) return undefined
+      return standalone ? claimTimerItem(item, args) : claimRunTimerItem(item, args)
+    },
+    async claimScheduleBucket(args) {
+      const item = await get(scheduleKey(args.scheduleId))
+      return item && item.duePK === 'SCHEDULE' && item.dueSK <= args.now
+        ? claimScheduleItem(item, args) : undefined
+    },
     withLeaseOwner<T>(leaseOwner: string, run: () => Promise<T>) { return ownerContext.run(leaseOwner, run) },
     async createRun(args) {
       const PK = runKey(args.runId)
@@ -250,30 +343,9 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
     },
     async claimDueTimers(args) {
       // Paused run state is itself a durable timer index; no save-state/scheduleTimer crash gap.
-      const repaired = await candidates('TIMER_RUN', args.now, args.limit, async item => {
-        const run = item.run as WorkflowExecution
-        const wait = run?.waitingFor
-        if (item.deleted || run?.status !== 'paused' || wait?.signalName !== '__timer' || typeof wait.deadline !== 'number' || wait.deadline > args.now) return undefined
-        if (item.timerLease?.expiresAt > args.now) return undefined
-        const signalId = `timer:${run.runId}:${wait.stepId}:${wait.deadline}`
-        try {
-          await replace(item, { timerLease: lease(args.leaseOwner, args.leaseMs, args.now) })
-          return { runId: run.runId, workflowId: run.workflowId, workflowVersion: run.workflowVersion, wakeAt: wait.deadline, signalId }
-        } catch (error) { if (isConflict(error)) return undefined; throw error }
-      })
+      const repaired = await candidates('TIMER_RUN', args.now, args.limit, item => claimRunTimerItem(item, args))
       if (repaired.length >= args.limit) return repaired
-      const scheduled = await candidates('TIMER', args.now, args.limit - repaired.length, async item => {
-        if (typeof item.wakeAt !== 'number' || item.wakeAt > args.now || !item.duePK) return undefined
-        const current = await get(runKey(item.runId))
-        // Real runtime waits are covered by TIMER_RUN. Remove orphan/completed/delivered timers.
-        if (!current || current.deleted || terminal(current.run.status) || current.pending || current.state) {
-          await remove(item.PK)
-          return undefined
-        }
-        if (item.lease?.expiresAt > args.now) return undefined
-        try { await replace(item, { lease: lease(args.leaseOwner, args.leaseMs, args.now) }); return { runId: item.runId, workflowId: item.workflowId, workflowVersion: item.workflowVersion, wakeAt: item.wakeAt, signalId: item.signalId } }
-        catch (error) { if (isConflict(error)) return undefined; throw error }
-      })
+      const scheduled = await candidates('TIMER', args.now, args.limit - repaired.length, item => claimTimerItem(item, args))
       return [...repaired, ...scheduled]
     },
     async deliverSignal<TPayload>(args: DeliverSignalArgs<TPayload>): Promise<DeliverSignalResult> {
@@ -310,38 +382,7 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
         return { ...fields, nextFireAt, ...scheduleDueFields(next) }
       })
     },
-    async claimDueScheduleBuckets(args) { return candidates('SCHEDULE', args.now, args.limit, async schedule => {
-      const pending = schedule.pendingBucket
-      if (pending) {
-        if (pending.lease.expiresAt > args.now) return undefined
-        const nextBucket = { ...pending, lease: lease(args.leaseOwner, args.leaseMs, args.now) }
-        try {
-          await replace(schedule, { pendingBucket: nextBucket, ...scheduleDueFields({ ...schedule, pendingBucket: nextBucket }) })
-          return nextBucket as ScheduleBucket
-        } catch (error) { if (isConflict(error)) return undefined; throw error }
-      }
-      if (!schedule.enabled || typeof schedule.nextFireAt !== 'number' || !Number.isFinite(schedule.nextFireAt) || schedule.nextFireAt > args.now ||
-          (schedule.lastStartedAt !== undefined && schedule.nextFireAt <= schedule.lastStartedAt)) return undefined
-      if (!['skip', 'allow'].includes(schedule.overlapPolicy)) throw new Error(`Unsupported schedule overlap policy: ${schedule.overlapPolicy}`)
-      if (schedule.overlapPolicy === 'skip' && schedule.activeRunId) {
-        const active = await store.loadRun(schedule.activeRunId)
-        if (active && !terminal(active.status)) {
-          // Consume this tick atomically. A concurrent schedule update forces fresh evaluation.
-          const next = { ...schedule, lastStartedAt: schedule.nextFireAt }
-          try { await replace(schedule, { lastStartedAt: next.lastStartedAt, ...scheduleDueFields(next) }) }
-          catch (error) { if (!isConflict(error)) throw error }
-          return undefined
-        }
-      }
-      const bucketId = String(schedule.nextFireAt)
-      const bucket = { scheduleId: schedule.scheduleId, bucketId, workflowId: schedule.workflowId, workflowVersion: schedule.workflowVersion,
-        runId: `${schedule.workflowId}:${schedule.scheduleId}:${bucketId}`, fireAt: schedule.nextFireAt, input: schedule.input,
-        overlapPolicy: schedule.overlapPolicy, lease: lease(args.leaseOwner, args.leaseMs, args.now) }
-      try {
-        await replace(schedule, { pendingBucket: bucket, ...scheduleDueFields({ ...schedule, pendingBucket: bucket }) })
-        return bucket as ScheduleBucket
-      } catch (error) { if (isConflict(error)) return undefined; throw error }
-    }) },
+    async claimDueScheduleBuckets(args) { return candidates('SCHEDULE', args.now, args.limit, item => claimScheduleItem(item, args)) },
     async markScheduleBucketStarted(args) {
       const leaseOwner = owner()
       if (!leaseOwner) throw new Error('withLeaseOwner is required to mark a schedule bucket started')
@@ -362,27 +403,7 @@ export function createDynamoWorkflowExecutionStore(options: DynamoWorkflowStoreO
         return { run, recoveryError: String(args.error), ...dueFields(run) }
       })
     },
-    async claimStaleRuns(args) { return candidates('RUNNING', args.now, args.limit, async item => {
-      if (item.deleted || !['queued', 'running'].includes(item.run.status) || (item.run.lease && item.run.lease.expiresAt > args.now)) return undefined
-      const next = { ...item.run, status: 'running', lease: lease(args.leaseOwner, args.leaseMs, args.now), updatedAt: args.now }
-      let claimed: Item
-      try { claimed = await replace(item, { run: next, ...dueFields(next) }) }
-      catch (error) { if (isConflict(error)) return undefined; throw error }
-      try { if (claimed.pending) {
-        await store.withLeaseOwner(args.leaseOwner, async () => {
-          if (!claimed.state) throw new Error('Pending delivery has no durable run state')
-          const history = await readEvents({ runId: next.runId })
-          const seed = buildPendingResolution(claimed.pending, claimed.state, history.map(event => event.event))
-          if (seed) await store.appendEvents({ runId: next.runId, expectedNextIndex: history.length, events: [seed] })
-          else await mutate(item.PK, current => { fence(current); return { pending: undefined } })
-        })
-      }
-      } catch (error) {
-        await store.deferRunRecovery!({ runId: next.runId, leaseOwner: args.leaseOwner, now: args.now, error })
-        return undefined
-      }
-      return { run: next, lease: next.lease }
-    }) },
+    async claimStaleRuns(args) { return candidates('RUNNING', args.now, args.limit, item => claimStaleRunItem(item, args)) },
     async listRuns(args) {
       // Administrative listing; Scan is intentionally explicit and is not used by scheduler/claims.
       const runs: RunSummary[] = []

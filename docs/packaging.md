@@ -30,7 +30,7 @@ These checks establish that the artifact can be consumed and the templates are s
 This package includes the TanStack Workflow core/runtime source snapshot at commit
 `b9287174b44424059895a0ed834b18ce50e0484a`. Its MIT license and provenance notice
 are distributed under `src/vendor/tanstack`. ESM imports are rewritten for packaging. Small recovery patches persist terminal
-validation/version errors and isolate failed sweep candidates with retry backoff;
+validation/version errors, isolate failed claims with retry backoff, and add the host `processTarget` API with optional direct store claims;
 the provenance notice enumerates these changes. The snapshot includes interrupted-run
 recovery absent from the published core/runtime packages at review time.
 

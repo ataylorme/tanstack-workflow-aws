@@ -2,11 +2,16 @@
 
 The DynamoDB store persists work; it does **not** provision a scheduler or background workers. The optional examples replace permanent minute-based sweeps with:
 
-```text
-committed workflow state → local DynamoDB Stream → dispatcher
-  ├─ due/near-term work → SQS (bounded delay)
-  └─ future deadline → one-time EventBridge Scheduler → SQS
-SQS → sweeper → shared runtime/store → next durable wakeup before acknowledgement
+```mermaid
+flowchart TB
+    state[("Committed workflow metadata")] -->|"DynamoDB Stream"| dispatcher["Dispatcher reads current item"]
+    dispatcher -->|"Due or near-term"| queue["SQS keyed wakeup"]
+    dispatcher -->|"Future deadline"| scheduler["One-time Scheduler"]
+    scheduler --> queue
+    queue --> worker["Targeted worker"]
+    worker -->|"Strong read and conditional claim"| state
+    worker -->|"Unresolved near-term work"| queue
+    worker -->|"Unresolved future deadline"| scheduler
 ```
 
 Deploy the independent path in both application Regions. Application-event delivery remains a separate stream consumer/bridge. If a domain event should start a workflow, its consumer calls the runtime; the resulting workflow metadata—not the domain event itself—drives deadline scheduling.
@@ -16,11 +21,61 @@ Deploy the independent path in both application Regions. Application-event deliv
 - The dispatcher filters workflow due categories `RUNNING`, `TIMER_RUN`, `TIMER`, and `SCHEDULE`, then strongly reads current state. History records and application events are not workflow wakeups.
 - Effective deadlines include execution and timer-claim leases. Overdue/near-term work uses delayed SQS messages; future deadlines use deterministic one-time schedules with flexible windows off and automatic deletion. Obsolete messages are harmless after authoritative state checks.
 - Scheduler has [60-second precision](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html), not subsecond guarantees. Near-term delivery avoids creating an already-past schedule; creation crossing the deadline also requires an immediate durable fallback.
-- The sweeper retains runtime lease ownership/fencing, bounded execution, partial-batch retries, and durable continuations before acknowledging unresolved work. A temporarily empty, eventually consistent `DueIndex` is not proof that the triggering work completed.
+- The targeted worker retains runtime lease ownership/fencing, bounded execution, partial-batch retries, and durable continuations before acknowledging unresolved work. It calls `runtime.processTarget`, which directly claims one base-table item; normal keyed delivery never queries `DueIndex` or scans for other due work. A failed claim or empty result is not proof of completion: the worker rereads the named item.
 - Independent regional delivery intentionally produces duplicates. MRSC conditional writes coordinate claims; external effects still need idempotency keys. This design does not provide exactly-once external delivery.
-- Completed runs and indefinite signal/approval waits need no recurring wakeups. New durable transitions resume processing. An intentionally recurring workflow schedule still produces recurring work.
-- The default SQS mapping has no maximum-concurrency cap, allowing [Lambda’s low-traffic polling optimization](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-scaling.html). Empty queues still incur polling requests. The explicit empty `ScalingConfig` clears existing caps; adding a cap disables that optimization. Bursts can cause redundant shared due-work reads, so validate concurrent claims and regional recovery for your workload before changing scaling.
+- Completed runs and indefinite signal/approval waits need no recurring wakeups. New durable transitions resume processing. The worker processes a persisted schedule bucket; it does not automatically materialize future cron/interval ticks. Applications must continue supplying schedule definitions/ticks through the existing materialization or `upsertSchedule` API. Intentional recurring application work is distinct from idle sweep polling.
+- The default SQS mapping has no maximum-concurrency cap, allowing [Lambda’s low-traffic polling optimization](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-scaling.html). Empty queues still incur polling requests. The explicit empty `ScalingConfig` clears existing caps; adding a cap disables that optimization. Duplicate deliveries can still cause redundant reads of the named item, but do not trigger shared due-work queries. Validate concurrent claims and regional recovery for your workload before changing scaling.
 - Removing periodic polling eliminates those idle invocations and queries, **not all AWS charges**. Provisioned resources, storage, retained logs, and actual workflow/event activity can still cost money.
+
+## Targeted runtime and claims
+
+The transport remains DynamoDB Streams, SQS and one-time EventBridge Scheduler. The version-1 `due` envelope still carries `{ key, dueKind, dueAt }`; no table migration or queue replacement is required. `dueKind` and `dueAt` in a message are hints. The worker rereads the item and uses its **current** category and effective deadline, so a delayed run-recovery message can safely become a timer wakeup for the same run.
+
+| Current due category | `processTarget` target | Direct store claim |
+| --- | --- | --- |
+| `RUNNING` | `{ kind: 'run', runId }` | `claimStaleRun` |
+| `TIMER_RUN` | `{ kind: 'timer', runId }` | `claimTimer` on the persisted run wait |
+| `TIMER` | `{ kind: 'timer', runId, signalId }` | `claimTimer` on the standalone timer row |
+| `SCHEDULE` | `{ kind: 'schedule', scheduleId }` | `claimScheduleBucket` |
+
+The example decodes standalone timer IDs from the store's encoded key format. It never splits run or schedule IDs on embedded delimiters. All direct claims strongly read the base item, check eligibility and leases, then use the same version-conditional claim logic as legacy sweeps. Recovery of accepted signals/approvals, timer deduplication, pending schedule buckets, and `skip`/`allow` overlap policies remain shared behavior.
+
+```ts
+await store.withLeaseOwner(owner, () => runtime.processTarget({
+  target: { kind: 'run', runId },
+  leaseOwner: owner,
+  maxDurationMs: 5_000,
+  includeEvents: false,
+}))
+```
+
+`processTarget` executes at most one claimed run, timer, or schedule bucket per call. It returns `recovered`, `timers`, `scheduled`, `summary`, and `deadlineReached`; it makes no claim about unrelated backlog and has no `remainingMayExist` flag. It uses the matching packaged runtime's replay, execution-budget, lease, and recovery-backoff behavior. Stores without the selected optional direct-claim method fail explicitly; there is no fallback to broad discovery. The DynamoDB store implements all three methods; the vendored in-memory store does not implement this host extension.
+
+This runtime method does not provision or persist transport wakeups. The SQS example in `examples/sweeper.ts` supplies that responsibility: before acknowledging a keyed message it rereads the same item, and if unresolved, persists a successor at the later of the effective deadline and one second from now. Short delays use SQS; longer deadlines use Scheduler. Propagated read, execution, or continuation-delivery errors become SQS partial-batch failures. Recoverable driver failures that successfully persist backoff return diagnostics and follow the same keyed continuation path. Completed/deleted items and indefinite waits produce no successor. Independent stream wakeups may duplicate this continuation, and conditional claims make those duplicates safe.
+
+```mermaid
+flowchart TB
+    message["Keyed SQS message"] --> read["Strongly read named item"]
+    read -->|"No due work"| ack["Acknowledge"]
+    read -->|"Future deadline or live lease"| persist["Persist keyed successor"]
+    read -->|"Due now"| execute["processTarget: one conditional claim"]
+    execute --> reread["Strongly reread same item"]
+    reread -->|"No due work"| ack
+    reread -->|"Unresolved work"| persist
+    persist --> ack
+    execute -->|"Failure"| retry["SQS partial-batch retry"]
+    persist -->|"Failure"| retry
+    read -->|"Failure"| retry
+    reread -->|"Failure"| retry
+```
+
+## Upgrade an existing demand-driven deployment
+
+Keep the existing queues, schedules, stream mappings, IAM roles, table and `DueIndex`. Deploy the updated runtime/store and `sweeper.js` together under an immutable artifact key in each Region. The dispatcher and message format remain compatible, so pending version-1 keyed messages and one-time schedules automatically use targeted processing after worker replacement.
+
+The filename `sweeper.ts`, Lambda handler `sweeper.handler`, stack outputs, and CloudFormation logical IDs are retained for deployment compatibility. Explicit `{ kind: 'sweep' }` invocations and old version-1 `drain` queue messages still invoke bounded legacy sweeps; only an old drain may enqueue another drain. New keyed messages never emit drains or call `runtime.sweep`. Keep `DueIndex` and discovery permissions while these compatibility paths exist. A rollback to the previous demand-driven worker can consume the same keyed messages and resumes its old sweeping behavior.
+
+After pending legacy drains finish, verify normal keyed processing produces no `Query`/`Scan` calls or broad claims. Do not purge pending messages to achieve this. Test duplicate delivery, run-to-timer transitions, and continuation persistence in both Regions. If the deployment still uses a periodic rule, follow the polling migration below before removing it.
 
 ## Build and deploy
 

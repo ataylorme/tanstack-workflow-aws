@@ -2,48 +2,48 @@
 
 An experimental `WorkflowExecutionStore` package for **TanStack Workflow** on AWS. It provides a DynamoDB execution store and a runnable, two-Region Lambda/EventBridge Scheduler/SQS/CloudFront example. It does not use Vercel Workflow.
 
-The package implements the included TanStack Workflow snapshot’s store interface. Import the matching engine from this package’s `/workflow` and `/runtime` entry points; see [snapshot provenance and packaging](docs/packaging.md). Both `us-west-2` and `us-east-1` may accept requests, execute workflows and sweep due work independently. They use their local replica of one **MRSC** DynamoDB Global Table; a witness in `us-east-2` forms the third quorum member. The same run can resume in either application Region.
+The package implements the included TanStack Workflow snapshot’s store interface. Import the matching engine from this package’s `/workflow` and `/runtime` entry points; see [snapshot provenance and packaging](docs/packaging.md). Both `us-west-2` and `us-east-1` may accept requests, execute workflows and process targeted wakeups independently. They use their local replica of one **MRSC** DynamoDB Global Table; a witness in `us-east-2` forms the third quorum member. The same run can resume in either application Region.
 
 > **Status:** experimental, prepared for controlled AWS integration testing. Regression tests exercise real DynamoDB expressions against DynamoDB Local, upstream store contracts, interrupted runtime recovery, and the installed package. Live MRSC replication, regional failure injection and load testing remain required before production use. See [review evidence and the AWS test plan](docs/testing.md). No AWS deployment has been performed during this review.
 
 ## Architecture
 
-The standalone example runs request handlers and background sweepers in both application Regions. Each Lambda uses the packaged workflow runtime and DynamoDB store against its local replica of one MRSC Global Table.
+The standalone example runs request handlers and targeted background workers in both application Regions. Each Lambda uses the packaged workflow runtime and DynamoDB store against its local replica of one MRSC Global Table.
 
 ```mermaid
 flowchart TB
-    client["Client"] --> edge["CloudFront + Lambda@Edge<br/>Deterministic regional routing"]
-
+    client["Client"] --> edge["CloudFront and Lambda@Edge routing"]
     subgraph west["us-west-2"]
-        westApi["API Gateway HTTP API"] --> westWorker["Request Lambda<br/>Workflow runtime + store"]
-        westTable --> westDispatch["Stream dispatcher"]
-        westDispatch --> westSchedule["One-time Scheduler / SQS"]
-        westSchedule --> westSweep["Sweep Lambda<br/>Workflow runtime + store"]
-        westWorker --> westTable[("DynamoDB replica<br/>Run state, events, timers, schedules<br/>DueIndex")]
-        westSweep --> westTable
+        westApi["HTTP API and request Lambda"] --> westTable[("DynamoDB replica")]
+        westTable -->|"Local stream"| westDispatch["Dispatcher"]
+        westDispatch -->|"Due or near-term key"| westQueue["SQS"]
+        westDispatch -->|"Future deadline"| westSchedule["One-time Scheduler"]
+        westSchedule --> westQueue
+        westQueue --> westWorker["Targeted worker: processTarget"]
+        westWorker -->|"Read, claim and execute named item"| westTable
+        westWorker -->|"Near-term continuation"| westQueue
+        westWorker -->|"Future continuation"| westSchedule
     end
-
     subgraph east["us-east-1"]
-        eastApi["API Gateway HTTP API"] --> eastWorker["Request Lambda<br/>Workflow runtime + store"]
-        eastTable --> eastDispatch["Stream dispatcher"]
-        eastDispatch --> eastSchedule["One-time Scheduler / SQS"]
-        eastSchedule --> eastSweep["Sweep Lambda<br/>Workflow runtime + store"]
-        eastWorker --> eastTable[("DynamoDB replica<br/>Run state, events, timers, schedules<br/>DueIndex")]
-        eastSweep --> eastTable
+        eastApi["HTTP API and request Lambda"] --> eastTable[("DynamoDB replica")]
+        eastTable -->|"Local stream"| eastDispatch["Dispatcher"]
+        eastDispatch -->|"Due or near-term key"| eastQueue["SQS"]
+        eastDispatch -->|"Future deadline"| eastSchedule["One-time Scheduler"]
+        eastSchedule --> eastQueue
+        eastQueue --> eastWorker["Targeted worker: processTarget"]
+        eastWorker -->|"Read, claim and execute named item"| eastTable
+        eastWorker -->|"Near-term continuation"| eastQueue
+        eastWorker -->|"Future continuation"| eastSchedule
     end
-
-    subgraph ohio["us-east-2"]
-        witness["DynamoDB MRSC witness<br/>Quorum participant"]
-    end
-
+    witness["us-east-2 MRSC witness"]
     edge --> westApi
     edge --> eastApi
-    westTable <-->|MRSC replication| eastTable
+    westTable <-->|"MRSC replication"| eastTable
     westTable -.-> witness
     eastTable -.-> witness
 ```
 
-Solid arrows show request, invocation and store access paths; dotted links show witness participation in the MRSC quorum, not application access. Both Regions independently wake due work from committed state changes and one-time deadlines, with conditional writes and leases coordinating ownership. No permanent minute-based rule is needed. Installing the store alone does not install this wakeup path; deploy the example infrastructure described in [demand-driven wakeups](docs/workflow-wakeups.md). Lambda@Edge provides placement, **not automatic POST failover**. The Global Table is provisioned by one CloudFormation stack, not one per replica. See [the standalone deployment](#standalone-aws-example) and [the existing-app integration guide](docs/tanstack-start-lambda-web-adapter.md).
+Solid arrows show request, invocation and store access paths; dotted links show witness participation in the MRSC quorum, not application access. Both Regions independently wake due work from committed state changes and one-time deadlines, with conditional writes and leases coordinating ownership. Each keyed delivery processes only its named run, timer, or schedule. The worker persists a continuation before acknowledgement when that item still has due work. No permanent minute-based rule is needed. Installing the store alone does not install this wakeup path; deploy the example infrastructure described in [demand-driven wakeups](docs/workflow-wakeups.md). Lambda@Edge provides placement, **not automatic POST failover**. The Global Table is provisioned by one CloudFormation stack, not one per replica. See [the standalone deployment](#standalone-aws-example) and [the existing-app integration guide](docs/tanstack-start-lambda-web-adapter.md).
 
 ## Install and use
 
@@ -72,7 +72,7 @@ const result = await store.withLeaseOwner(owner, () => runtime.startRun({
 }))
 ```
 
-Pass `leaseOwner: owner` to `runtime.deliverSignal`, `runtime.deliverApproval` and `runtime.sweep` as well. Keep each call within `withLeaseOwner`. This binds state writes and event commits to the current lease; a resumed worker cannot silently accept a previous worker's write after reclaim. The store can be used directly for inspection without owner context; **do not execute workflows without the context in a multi-worker deployment**. If supplying a custom `DynamoDBDocumentClient`, configure `marshallOptions.removeUndefinedValues: true`.
+Pass `leaseOwner: owner` to `runtime.deliverSignal`, `runtime.deliverApproval`, `runtime.processTarget` and any explicit `runtime.sweep` as well. Keep each call within `withLeaseOwner`. This binds state writes and event commits to the current lease; a resumed worker cannot silently accept a previous worker's write after reclaim. The store can be used directly for inspection without owner context; **do not execute workflows without the context in a multi-worker deployment**. If supplying a custom `DynamoDBDocumentClient`, configure `marshallOptions.removeUndefinedValues: true`.
 
 ## Design
 
@@ -82,25 +82,25 @@ Pass `leaseOwner: owner` to `runtime.deliverSignal`, `runtime.deliverApproval` a
 | Event log | `RUN#id / SEG#uuid` | Stage immutable batch, then publish `head` and `nextIndex` on run item with one CAS |
 | Timer | Paused run metadata; standalone timer rows for direct store clients | Persisted waits remain discoverable even if timer registration is interrupted |
 | Schedule | `SCHEDULE#id / META`, including its pending bucket | One-item conditional claim preserves unfinished buckets when the next tick advances |
-| Due work | Sparse `DueIndex` | GSI is eventual; authoritative decisions always use base table conditional writes |
+| Due work | Keyed stream/SQS wakeups; sparse `DueIndex` for legacy sweeps | Targeted claims use strongly consistent base-table reads and conditional writes |
 
 `appendEvents` stages all events of a batch in one item. A single conditional update to `RUN#id / META` publishes the batch. A reader starts at that pointer and follows `previous` links, so it sees the whole batch or none of it. A failed conditional commit can leave an unreachable segment; it is safe for replay, but requires offline garbage collection. Never delete a staged segment solely because the client timed out: the commit might have succeeded. The event chain is retained after a run is deleted, and `deleteRun` leaves a tombstone to prevent inadvertent ID reuse.
 
 This relies on **MRSC** conditional writes and strongly consistent reads. Ordinary MREC Global Tables can accept the same local conditional claim in two Regions and are unsafe for this active/active design. MRSC has no DynamoDB transactions or TTL; explicit retention and orphan cleanup are application responsibilities. The run item also stores delivered signal IDs for atomic deduplication. Large run state, a high number of signal IDs or an event batch above DynamoDB's 400 KB item limit will fail; this prototype does not spill payloads to external storage. Event reads walk the entire chain and administrative `listRuns` uses a table Scan. `DueIndex` currently uses four unsharded partition values (`RUNNING`, `TIMER_RUN`, `TIMER`, `SCHEDULE`), so it needs a shard design and load testing at high throughput.
 
-A GSI is eventually consistent even on an MRSC table. The wakeup worker persists a continuation before acknowledging unresolved work, including delayed index visibility. Duplicate queue deliveries and candidate reads are harmless to claims, but **external side effects still require idempotency keys** because a worker can die after a side effect and before its completion event commits. Keep clock skew below the lease margin; use a lease longer than the maximum expected store write and heartbeat interval. A lost MRSC quorum prevents writes; no store can continue safely in a single isolated Region under this consistency model.
+Normal keyed wakeups call `runtime.processTarget` for one run, timer, or schedule; they do not query `DueIndex` or discover unrelated work. The worker rereads the named item and persists a keyed continuation before acknowledging unresolved work. `DueIndex` remains eventually consistent and is used only by explicit/legacy sweeps. Duplicate deliveries are harmless to claims, but **external side effects still require idempotency keys** because a worker can die after a side effect and before its completion event commits. Keep clock skew below the lease margin; use a lease longer than the maximum expected store write and heartbeat interval. A lost MRSC quorum prevents writes; no store can continue safely in a single isolated Region under this consistency model.
 
-Queued runs and expired or released running leases are sweep candidates. Accepted signals and approvals persist their payload with the deduplication ID; recovery publishes the resolution event and clears that payload atomically. Schedule policies `allow` and `skip` are supported; `buffer-one`, `cancel-previous` and `terminate-previous` are rejected. Schedule metadata changed during this pre-release review: use a fresh test table rather than mixing old prototype workers or records with this implementation.
+Queued runs and expired or released running leases are targeted recovery candidates (and remain discoverable by explicit sweeps). Accepted signals and approvals persist their payload with the deduplication ID; recovery publishes the resolution event and clears that payload atomically. Schedule policies `allow` and `skip` are supported; `buffer-one`, `cancel-previous` and `terminate-previous` are rejected. Schedule metadata changed during this pre-release review: use a fresh test table rather than mixing old prototype workers or records with this implementation.
 
 ## Framework-independent package
 
-The library implements TanStack Workflow's store contract for a Node.js runtime. It has no dependency on TanStack Start, Lambda Web Adapter, an application's database, or an HTTP routing framework. Applications supply their workflow definitions and may use any business datastore. The Lambda handlers and CloudFormation templates are optional deployment examples; separate regional sweep Lambdas can share any application's workflow registry.
+The library implements TanStack Workflow's store contract for a Node.js runtime. It has no dependency on TanStack Start, Lambda Web Adapter, an application's database, or an HTTP routing framework. Applications supply their workflow definitions and may use any business datastore. The Lambda handlers and CloudFormation templates are optional deployment examples; separate regional targeted worker Lambdas can share any application's workflow registry.
 
 ## TanStack Start with Lambda Web Adapter and Aurora DSQL
 
-For an existing Start application in `us-east-1` and `us-west-2`, use this package in server functions/routes alongside your DSQL client. DSQL remains the application database; DynamoDB MRSC holds workflow coordination and history. The recommended deployment adds a stream dispatcher, one-time EventBridge Scheduler schedules, and an SQS-backed sweep Lambda in each application Region, sharing the same workflow definitions as the web application. Reuse the application's existing CloudFront/Lambda@Edge ingress.
+For an existing Start application in `us-east-1` and `us-west-2`, use this package in server functions/routes alongside your DSQL client. DSQL remains the application database; DynamoDB MRSC holds workflow coordination and history. The recommended deployment adds a stream dispatcher, one-time EventBridge Scheduler schedules, and an SQS-backed targeted worker Lambda in each application Region, sharing the same workflow definitions as the web application. Reuse the application's existing CloudFront/Lambda@Edge ingress.
 
-See [the integration guide](docs/tanstack-start-lambda-web-adapter.md) for request ownership, bounded execution, the DSQL outbox boundary, and the dedicated [sweeper template](cloudformation/sweeper.yaml). These integration files do not provision or modify DSQL clusters or your Start application.
+See [the integration guide](docs/tanstack-start-lambda-web-adapter.md) for request ownership, bounded execution, the DSQL outbox boundary, and the dedicated [worker template](cloudformation/sweeper.yaml). These integration files do not provision or modify DSQL clusters or your Start application.
 
 ## Standalone AWS example
 

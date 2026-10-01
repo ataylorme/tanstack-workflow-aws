@@ -3,7 +3,7 @@ import { createWorkflow } from '../src/workflow.js'
 import { defineWorkflowRuntime } from '../src/runtime.js'
 import { createTestStore } from './support/dynamodb.js'
 
-describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('real DynamoDB runtime crash recovery', () => {
+describe.skipIf(!process.env.DYNAMODB_ENDPOINT).each(['sweep', 'target'] as const)('real DynamoDB runtime crash recovery (%s)', mode => {
   const cleanups: Array<() => Promise<unknown>> = []
   afterEach(async () => { vi.restoreAllMocks(); await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
   async function fixture() {
@@ -17,7 +17,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('real DynamoDB runtime crash rec
     const workflow = createWorkflow({ id: 'queued' }).handler(async () => ({ recovered: true }))
     const runtime = defineWorkflowRuntime({ store, workflows: { queued: { load: async () => workflow } } })
     await store.createRun({ runId: 'queued-crash', workflowId: 'queued', input: {}, now: Date.now() })
-    await store.withLeaseOwner('east:queued-recovery', () => runtime.sweep({ leaseOwner: 'east:queued-recovery', now: Date.now() + 120_000 }))
+    await store.withLeaseOwner('east:queued-recovery', () => mode === 'sweep' ? runtime.sweep({ leaseOwner: 'east:queued-recovery', now: Date.now() + 120_000 }) : runtime.processTarget({ target: { kind: 'run', runId: 'queued-crash' }, leaseOwner: 'east:queued-recovery', now: Date.now() + 120_000 }))
     expect(await store.loadRun('queued-crash')).toMatchObject({ status: 'finished', output: { recovered: true } })
   })
 
@@ -30,7 +30,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('real DynamoDB runtime crash rec
     await store.withLeaseOwner('west:start', () => runtime.startRun({ workflowId: 'signal', runId: 'signal-crash', input: {}, leaseOwner: 'west:start' }))
     const args = { runId: 'signal-crash', delivery: { signalId: 'once', name: 'continue', payload: { value: 42 } }, now: Date.now() }
     expect((await store.deliverSignal(args)).kind).toBe('delivered')
-    await store.withLeaseOwner('east:recover', () => runtime.sweep({ leaseOwner: 'east:recover', now: Date.now() + 120_000 }))
+    await store.withLeaseOwner('east:recover', () => mode === 'sweep' ? runtime.sweep({ leaseOwner: 'east:recover', now: Date.now() + 120_000 }) : runtime.processTarget({ target: { kind: 'run', runId: 'signal-crash' }, leaseOwner: 'east:recover', now: Date.now() + 120_000 }))
     expect(await store.loadRun(args.runId)).toMatchObject({ status: 'finished', output: { value: 42 } })
     expect((await store.deliverSignal(args)).kind).toBe('duplicate')
     const resolutions = (await store.readEvents({ runId: args.runId })).filter(item => item.event.type === 'SIGNAL_RESOLVED')
@@ -48,7 +48,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('real DynamoDB runtime crash rec
     const state = await store.loadRunState('approval-crash')
     const approvalId = state!.pendingApproval!.approvalId
     expect((await store.deliverApproval({ runId: 'approval-crash', approval: { approvalId, approved: true, feedback: 'Proceed' }, now: Date.now() })).kind).toBe('delivered')
-    await store.withLeaseOwner('east:approve-recover', () => runtime.sweep({ leaseOwner: 'east:approve-recover', now: Date.now() + 120_000 }))
+    await store.withLeaseOwner('east:approve-recover', () => mode === 'sweep' ? runtime.sweep({ leaseOwner: 'east:approve-recover', now: Date.now() + 120_000 }) : runtime.processTarget({ target: { kind: 'run', runId: 'approval-crash' }, leaseOwner: 'east:approve-recover', now: Date.now() + 120_000 }))
     expect(await store.loadRun('approval-crash')).toMatchObject({ status: 'finished', output: { approved: true } })
     expect((await store.readEvents({ runId: 'approval-crash' })).filter(item => item.event.type === 'APPROVAL_RESOLVED')).toHaveLength(1)
   })
@@ -64,7 +64,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('real DynamoDB runtime crash rec
     await expect(store.withLeaseOwner('west:timer-start', () => runtime.startRun({ workflowId: 'timer', runId: 'timer-crash', input: {}, leaseOwner: 'west:timer-start' }))).rejects.toThrow('crash before timer scheduling')
     timerCall.mockRestore()
     expect((await store.loadRunState('timer-crash'))?.waitingFor?.signalName).toBe('__timer')
-    await store.withLeaseOwner('east:timer-recover', () => runtime.sweep({ leaseOwner: 'east:timer-recover', now: Date.now() + 120_000 }))
+    await store.withLeaseOwner('east:timer-recover', () => mode === 'sweep' ? runtime.sweep({ leaseOwner: 'east:timer-recover', now: Date.now() + 120_000 }) : runtime.processTarget({ target: { kind: 'timer', runId: 'timer-crash' }, leaseOwner: 'east:timer-recover', now: Date.now() + 120_000 }))
     expect(await store.loadRun('timer-crash')).toMatchObject({ status: 'finished', output: { awake: true } })
   })
 
@@ -76,7 +76,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('real DynamoDB runtime crash rec
     await store.claimRun({ runId: 'released-crash', leaseOwner: 'west:released', leaseMs: 60_000, now: Date.now() })
     await store.withLeaseOwner('west:released', () => store.saveRunState({ state: { runId: 'released-crash', workflowId: 'released', input: {}, status: 'running', createdAt: Date.now(), updatedAt: Date.now() } }))
     await store.releaseRunLease({ runId: 'released-crash', leaseOwner: 'west:released' })
-    await store.withLeaseOwner('east:released-recover', () => runtime.sweep({ leaseOwner: 'east:released-recover', now: Date.now() + 120_000 }))
+    await store.withLeaseOwner('east:released-recover', () => mode === 'sweep' ? runtime.sweep({ leaseOwner: 'east:released-recover', now: Date.now() + 120_000 }) : runtime.processTarget({ target: { kind: 'run', runId: 'released-crash' }, leaseOwner: 'east:released-recover', now: Date.now() + 120_000 }))
     expect(await store.loadRun('released-crash')).toMatchObject({ status: 'finished', output: 'recovered' })
   })
 })

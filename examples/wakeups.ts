@@ -1,3 +1,4 @@
+import type { WorkflowWorkTarget } from '../src/runtime.js'
 import { createHash } from 'node:crypto'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
@@ -56,21 +57,41 @@ export async function dispatchKey(key: ItemKey, io: WakeupIO, now = Date.now()):
   else await io.schedule(wakeup, wakeup.dueAt)
 }
 
+/** Translate the authoritative item category, never the possibly stale message category. */
+export function workTarget(wakeup: DueWakeup): WorkflowWorkTarget {
+  const { PK } = wakeup.key
+  if (wakeup.dueKind === 'RUNNING' && PK.startsWith('RUN#')) return { kind: 'run', runId: PK.slice(4) }
+  if (wakeup.dueKind === 'TIMER_RUN' && PK.startsWith('RUN#')) return { kind: 'timer', runId: PK.slice(4) }
+  if (wakeup.dueKind === 'SCHEDULE' && PK.startsWith('SCHEDULE#')) return { kind: 'schedule', scheduleId: PK.slice(9) }
+  if (wakeup.dueKind === 'TIMER' && PK.startsWith('TIMER#')) {
+    const parts = PK.slice(6).split('#')
+    if (parts.length === 2) return { kind: 'timer', runId: decodeURIComponent(parts[0]!), signalId: decodeURIComponent(parts[1]!) }
+  }
+  throw new Error('Workflow due category does not match its item key')
+}
+
+export interface WakeupHandlers {
+  processTarget(target: WorkflowWorkTarget): Promise<unknown>
+  /** Compatibility only: drain messages produced by the previous worker. */
+  sweepLegacy(): Promise<{ remainingMayExist: boolean }>
+}
+
 export async function processWakeup(wakeup: Wakeup, io: WakeupIO,
-  sweep: () => Promise<{ remainingMayExist: boolean }>, now = Date.now): Promise<void> {
-  if (wakeup.kind === 'due') {
-    const current = dueWakeup(await io.read(wakeup.key))
-    if (!current) return
-    if (current.dueAt > now()) { await io.schedule(current, current.dueAt); return }
+  handlers: WakeupHandlers, now = Date.now): Promise<void> {
+  if (wakeup.kind === 'drain') {
+    // Only old, unkeyed messages may discover work. Never create these from keyed delivery.
+    const result = await handlers.sweepLegacy()
+    if (result.remainingMayExist) await io.enqueue({ version: 1, kind: 'drain' }, 1)
+    return
   }
-  const result = await sweep()
-  if (wakeup.kind === 'due') {
-    const pending = dueWakeup(await io.read(wakeup.key))
-    // An empty eventual GSI result is NOT evidence that this base item is done.
-    // Persist a new, future successor before acknowledging the current message.
-    if (pending) await io.schedule(pending, Math.max(pending.dueAt, now() + 60_000))
-  }
-  if (result.remainingMayExist) await io.enqueue({ version: 1, kind: 'drain' }, 1)
+  const current = dueWakeup(await io.read(wakeup.key))
+  if (!current) return
+  if (current.dueAt > now()) { await io.schedule(current, current.dueAt); return }
+  await handlers.processTarget(workTarget(current))
+  const pending = dueWakeup(await io.read(wakeup.key))
+  // A lost claim, bounded yield, or category transition is not completion. Persist
+  // a successor for this same key before acknowledging, even if its stream is delayed.
+  if (pending) await io.schedule(pending, Math.max(pending.dueAt, now() + 1000))
 }
 
 export interface WakeupConfig {
