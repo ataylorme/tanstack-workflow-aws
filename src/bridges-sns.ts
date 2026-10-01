@@ -1,0 +1,26 @@
+import { applicationEventDeduplicationId } from './event-identity.js'
+import { serializeApplicationEvent } from './event-validation.js'
+import { SNSClient, PublishCommand } from '@aws-sdk/client-sns'
+import type { ApplicationEvent, ApplicationEventHandler } from './events.js'
+
+export interface SnsBridgeOptions {
+  topicArn: string
+  client?: SNSClient
+  /** Required for FIFO topics; use a stable partition key for ordered delivery. */
+  messageGroupId?: (event: ApplicationEvent) => string
+}
+
+export function createSnsBridge(options: SnsBridgeOptions): ApplicationEventHandler {
+  if (!options.topicArn) throw new Error('topicArn is required')
+  if (options.topicArn.endsWith('.fifo') && !options.messageGroupId) throw new Error('messageGroupId is required for FIFO destinations')
+  const client = options.client ?? new SNSClient({})
+  return async event => {
+    await client.send(new PublishCommand({
+      TopicArn: options.topicArn,
+      Message: serializeApplicationEvent(event),
+      MessageAttributes: { eventType: { DataType: 'String', StringValue: event.type }, ordered: { DataType: 'String', StringValue: event.ordering ? 'true' : 'false' } },
+      ...(options.messageGroupId ? { MessageGroupId: options.messageGroupId(event), MessageDeduplicationId: applicationEventDeduplicationId(event) } : {}),
+    }))
+  }
+}
+

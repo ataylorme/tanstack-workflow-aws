@@ -1,0 +1,38 @@
+import { applicationEventGroupId } from '../src/ordered-events.js'
+import { EventBridgeClient } from '@aws-sdk/client-eventbridge'
+import { SNSClient } from '@aws-sdk/client-sns'
+import { SQSClient } from '@aws-sdk/client-sqs'
+import { createEventBridgeBridge } from '../src/bridges-eventbridge.js'
+import { createSnsBridge } from '../src/bridges-sns.js'
+import { createSqsBridge } from '../src/bridges-sqs.js'
+import { createWebhookBridge } from '../src/bridges-webhook.js'
+import { createApplicationQueueHandler } from '../src/wakeups.js'
+import type { ApplicationEventHandler } from '../src/events.js'
+
+// Transport relay only. Business handlers requiring cross-Region order use the
+// ordered subscriber factory, as shown in ordered-subscriber.ts.
+// Deploy this bundle behind a dedicated application subscription queue. Set BRIDGE_KIND
+// and the corresponding target variable in that Lambda's environment.
+const clientOptions = { maxAttempts: 2, requestHandler: { connectionTimeout: 1_000, requestTimeout: 4_000, throwOnRequestTimeout: true } }
+const kind = process.env.BRIDGE_KIND
+let bridge: ApplicationEventHandler
+switch (kind) {
+  case 'eventbridge':
+    bridge = createEventBridgeBridge({ client: new EventBridgeClient(clientOptions), eventBusName: process.env.EVENT_BUS_NAME!, source: process.env.EVENT_SOURCE! })
+    break
+  case 'sns':
+    bridge = createSnsBridge({ client: new SNSClient(clientOptions), topicArn: process.env.TOPIC_ARN!, ...(process.env.TOPIC_ARN?.endsWith('.fifo') ? { messageGroupId: applicationEventGroupId } : {}) })
+    break
+  case 'sqs':
+    bridge = createSqsBridge({ client: new SQSClient(clientOptions), queueUrl: process.env.QUEUE_URL!, ...(process.env.QUEUE_URL?.endsWith('.fifo') ? { messageGroupId: applicationEventGroupId } : {}) })
+    break
+  case 'webhook':
+    bridge = createWebhookBridge({
+      url: process.env.WEBHOOK_URL!,
+      headers: process.env.WEBHOOK_TOKEN ? { authorization: `Bearer ${process.env.WEBHOOK_TOKEN}` } : undefined,
+    })
+    break
+  default: throw new Error(`Unknown BRIDGE_KIND: ${kind}`)
+}
+
+export const handler = createApplicationQueueHandler(bridge, { fifo: true })

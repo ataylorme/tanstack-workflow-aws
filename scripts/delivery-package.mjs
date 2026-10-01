@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,8 +16,12 @@ try {
   execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', join(temporary, tarballName)], {
     cwd: temporary, stdio: 'inherit',
   })
+  for (const service of ['eventbridge', 'sns', 'sqs', 'scheduler']) {
+    if (existsSync(join(temporary, 'node_modules/@aws-sdk/client-' + service))) throw new Error('Optional bridge/example SDK unexpectedly installed: ' + service)
+  }
   writeFileSync(join(temporary, 'consumer.mjs'), `
 import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
+const { GetCommand } = await import('@aws-sdk/lib-dynamodb')
 const { createWorkflow } = await import('@ataylorme/tanstack-workflow-aws/workflow')
 const { defineWorkflowRuntime } = await import('@ataylorme/tanstack-workflow-aws/runtime')
 if (typeof createWorkflow !== 'function' || typeof defineWorkflowRuntime !== 'function') throw new Error('Missing pinned runtime exports')
@@ -25,16 +29,82 @@ const store = createDynamoWorkflowExecutionStore({ tableName: 'consumer-smoke' }
 if (typeof store.withLeaseOwner !== 'function' || typeof store.appendEvents !== 'function') {
   throw new Error('Published entry point does not expose the store')
 }
-console.log('Packed package import and store construction passed')
+const targetedStore = createDynamoWorkflowExecutionStore({ tableName: 'consumer-targeted', client: {
+  send: async command => {
+    if (!(command instanceof GetCommand) || command.input.ConsistentRead !== true) throw new Error('Targeted processing attempted discovery')
+    return {}
+  },
+} })
+const runtime = defineWorkflowRuntime({ store: targetedStore, workflows: {} })
+for (const target of [{ kind: 'run', runId: 'missing' }, { kind: 'timer', runId: 'missing' }, { kind: 'timer', runId: 'missing', signalId: 'timer' }, { kind: 'schedule', scheduleId: 'missing' }]) {
+  const result = await runtime.processTarget({ target })
+  if (result.recovered.length + result.timers.length + result.scheduled.length !== 0 || 'remainingMayExist' in result) throw new Error('Invalid targeted result')
+}
+const { createDynamoApplicationEventPublisher } = await import('@ataylorme/tanstack-workflow-aws/events')
+const { createApplicationStreamHandler } = await import('@ataylorme/tanstack-workflow-aws/event-stream')
+const { createWebhookBridge } = await import('@ataylorme/tanstack-workflow-aws/bridges/webhook')
+const event = await createDynamoApplicationEventPublisher({ tableName: 'test', client: { send: async () => ({}) } }).publish({ id: 'test', type: 'test', data: { works: true } })
+if (event.data.works !== true) throw new Error('Invalid event package export')
+if ((await createApplicationStreamHandler(() => {})({ Records: [] })).batchItemFailures.length !== 0) throw new Error('Invalid stream package export')
+createWebhookBridge({ url: 'https://example.test' })
+const { createApplicationQueueHandler, createWorkflowStreamRouter, createWorkflowWorker } = await import('@ataylorme/tanstack-workflow-aws/wakeups')
+const { publishWorkflowEvent, continueAsNew } = await import('@ataylorme/tanstack-workflow-aws/workflow-effects')
+const { nextScheduleTime } = await import('@ataylorme/tanstack-workflow-aws/schedules')
+const { createDynamoOrderedSubscriber, createDynamoOrderedEventPublisher } = await import('@ataylorme/tanstack-workflow-aws/ordered-events')
+if (typeof createDynamoOrderedSubscriber({ tableName: 'test', subscriberId: 'test', handler: async () => {} }).handler !== 'function') throw new Error('Invalid ordered subscriber export')
+if (typeof createDynamoOrderedEventPublisher({ tableName: 'test' }).read !== 'function') throw new Error('Invalid ordered publisher export')
+if ([createWorkflowStreamRouter, createWorkflowWorker, publishWorkflowEvent, continueAsNew].some(fn => typeof fn !== 'function')) throw new Error('Missing orchestration exports')
+if (nextScheduleTime({ kind: 'interval', everyMs: 100 }, 100) !== 200) throw new Error('Invalid schedule export')
+if ((await createApplicationQueueHandler(() => {})({ Records: [] })).batchItemFailures.length) throw new Error('Invalid application queue export')
+console.log('Packed core and orchestration imports passed without optional AWS clients')
 `)
   execFileSync(process.execPath, ['consumer.mjs'], { cwd: temporary, stdio: 'inherit' })
+  // Install each optional service independently; unrelated clients must not be
+  // needed just to load that adapter's subpath.
+  for (const [service, factory, options] of [
+    ['eventbridge', 'createEventBridgeBridge', { eventBusName: 'test', source: 'test' }],
+    ['sns', 'createSnsBridge', { topicArn: 'test' }],
+    ['sqs', 'createSqsBridge', { queueUrl: 'test' }],
+  ]) {
+    execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '@aws-sdk/client-' + service + '@' + manifest.peerDependencies['@aws-sdk/client-' + service]], { cwd: temporary, stdio: 'inherit' })
+    writeFileSync(join(temporary, 'bridge.mjs'), `import { ${factory} } from '@ataylorme/tanstack-workflow-aws/bridges/${service}'; ${factory}(${JSON.stringify(options)});`)
+    execFileSync(process.execPath, ['bridge.mjs'], { cwd: temporary, stdio: 'inherit' })
+  }
+  execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '@aws-sdk/client-scheduler@' + manifest.peerDependencies['@aws-sdk/client-scheduler']], { cwd: temporary, stdio: 'inherit' })
+  writeFileSync(join(temporary, 'aws.mjs'), `import { createAwsWorkflowTransport, createApplicationQueuePublisher } from '@ataylorme/tanstack-workflow-aws/aws';
+    const transport = createAwsWorkflowTransport({ tableName: 'test', queueUrl: 'test', queueArn: 'test', group: 'test', roleArn: 'test', dlqArn: 'test' });
+    if (typeof transport.schedule !== 'function' || typeof createApplicationQueuePublisher({ queueUrl: 'test' }) !== 'function') throw new Error('Invalid AWS exports');`)
+  execFileSync(process.execPath, ['aws.mjs'], { cwd: temporary, stdio: 'inherit' })
+  execFileSync('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '@types/aws-lambda@' + manifest.devDependencies['@types/aws-lambda']], { cwd: temporary, stdio: 'inherit' })
   writeFileSync(join(temporary, 'consumer.mts'), `
 import { createDynamoWorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws'
-import type { WorkflowExecutionStore } from '@ataylorme/tanstack-workflow-aws/runtime'
+import { defineWorkflowRuntime, type WorkflowExecutionStore, type WorkflowWorkTarget, type WorkflowRuntimeProcessTargetResult } from '@ataylorme/tanstack-workflow-aws/runtime'
 const store: WorkflowExecutionStore = createDynamoWorkflowExecutionStore({ tableName: 'consumer-smoke' })
-void store
+import { createDynamoApplicationEventPublisher } from '@ataylorme/tanstack-workflow-aws/events'
+import { createApplicationStreamHandler } from '@ataylorme/tanstack-workflow-aws/event-stream'
+import type { DynamoDBStreamHandler, SQSHandler } from 'aws-lambda'
+import { createWorkflowStreamRouter, createWorkflowWorker, createApplicationQueueHandler, type WakeupIO } from '@ataylorme/tanstack-workflow-aws/wakeups'
+const handler: DynamoDBStreamHandler = createApplicationStreamHandler(async event => { void event.data })
+const publisher = createDynamoApplicationEventPublisher({ tableName: 'test' })
+async function typedPayload() {
+  const result = await publisher.publish<{ value: number }>({ type: 'test', data: { value: 1 } })
+  const value: number = result.data.value
+  return value
+}
+const runtime = defineWorkflowRuntime({ store, workflows: {} })
+async function typedTarget(target: WorkflowWorkTarget): Promise<WorkflowRuntimeProcessTargetResult> {
+  return runtime.processTarget({ target, leaseOwner: 'consumer', maxDurationMs: 1000 })
+}
+const transport: WakeupIO = { read: async () => undefined, enqueue: async () => {}, schedule: async () => {} }
+const router: DynamoDBStreamHandler = createWorkflowStreamRouter({ transport, publishApplicationEvent: async () => {} })
+const worker: SQSHandler = createWorkflowWorker({ store: createDynamoWorkflowExecutionStore({ tableName: 'test' }), runtime, transport, publisher, region: 'test' })
+const application: SQSHandler = createApplicationQueueHandler(async () => {})
+import { createDynamoOrderedSubscriber } from '@ataylorme/tanstack-workflow-aws/ordered-events'
+const ordered: SQSHandler = createDynamoOrderedSubscriber({ tableName: 'test', subscriberId: 'test', handler: async (event, delivery) => { const sequence: number = event.ordering.sequence; const key: string = delivery.idempotencyKey; void sequence; void key } }).handler
+void ordered
+void store; void handler; void typedPayload; void typedTarget; void router; void worker; void application
 `)
-  execFileSync(join(root, 'node_modules/.bin/tsc'), ['--noEmit', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', '--target', 'ES2022', '--skipLibCheck', 'consumer.mts'], {
+  execFileSync(join(root, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--exactOptionalPropertyTypes', '--module', 'NodeNext', '--moduleResolution', 'NodeNext', '--target', 'ES2022', '--skipLibCheck', 'consumer.mts'], {
     cwd: temporary, stdio: 'inherit',
   })
 } finally {

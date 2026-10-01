@@ -202,6 +202,8 @@ export type WorkflowScheduleSpec =
     }
 
 export interface WorkflowScheduleDefinition {
+  missedTickPolicy?: 'skip' | 'run-once' | 'catch-up'
+  maxCatchUp?: number
   id?: ScheduleId
   schedule: WorkflowScheduleSpec
   overlapPolicy?: WorkflowOverlapPolicy
@@ -210,6 +212,8 @@ export interface WorkflowScheduleDefinition {
 }
 
 export interface UpsertScheduleArgs {
+  missedTickPolicy?: 'skip' | 'run-once' | 'catch-up'
+  maxCatchUp?: number
   scheduleId: ScheduleId
   workflowId: WorkflowId
   workflowVersion?: WorkflowVersion
@@ -304,6 +308,19 @@ export interface WorkflowRunStoreAdapterStore {
 
 export type WorkflowRunStoreAdapter = RunStore
 
+/** Host extension: one durable work item, independent of transport/storage keys. */
+export type WorkflowWorkTarget =
+  | { kind: 'run'; runId: RunId }
+  | { kind: 'timer'; runId: RunId; signalId?: string }
+  | { kind: 'schedule'; scheduleId: ScheduleId }
+
+export type ClaimTargetArgs = Omit<ClaimStaleRunsArgs, 'limit'>
+
+export type WorkflowRuntimeProcessTargetArgs = Omit<WorkflowRuntimeSweepArgs,
+  'limit' | 'maxRecoveredRuns' | 'maxScheduledRuns' | 'maxTimers'> & { target: WorkflowWorkTarget }
+
+export type WorkflowRuntimeProcessTargetResult = Omit<WorkflowRuntimeSweepResult, 'remainingMayExist'>
+
 export interface WorkflowExecutionStore extends WorkflowRunStoreAdapterStore {
   createRun: (args: CreateRunArgs) => Promise<CreateRunResult>
   loadRun: (runId: RunId) => Promise<WorkflowExecution | undefined>
@@ -335,6 +352,11 @@ export interface WorkflowExecutionStore extends WorkflowRunStoreAdapterStore {
 
   /** Host extension: preserve retriable recovery failures with bounded backoff. */
   deferRunRecovery?: (args: { runId: RunId; leaseOwner: LeaseOwner; now: number; error: unknown }) => Promise<void>
+  /** Direct authoritative claims. Required by processTarget; no discovery fallback. */
+  claimStaleRun?: (args: ClaimTargetArgs & { runId: RunId }) => Promise<RunClaim | undefined>
+  /** Omit signalId for a persisted run wait; supply it for a standalone timer row. */
+  claimTimer?: (args: ClaimTargetArgs & { runId: RunId; signalId?: string }) => Promise<TimerWakeup | undefined>
+  claimScheduleBucket?: (args: ClaimTargetArgs & { scheduleId: ScheduleId }) => Promise<ScheduleBucket | undefined>
   claimStaleRuns: (args: ClaimStaleRunsArgs) => Promise<ReadonlyArray<RunClaim>>
   listRuns: (args: ListRunsArgs) => Promise<ReadonlyArray<RunSummary>>
   getRunTimeline: (runId: RunId) => Promise<RunTimeline | undefined>
@@ -383,6 +405,8 @@ export interface WorkflowRuntimeDefinition<
   deliverApproval: (
     args: WorkflowRuntimeDeliverApprovalArgs,
   ) => Promise<WorkflowRuntimeRunResult>
+  /** Process at most one named work item without a due-index query. */
+  processTarget: (args: WorkflowRuntimeProcessTargetArgs) => Promise<WorkflowRuntimeProcessTargetResult>
   sweep: (
     args?: WorkflowRuntimeSweepArgs,
   ) => Promise<WorkflowRuntimeSweepResult>

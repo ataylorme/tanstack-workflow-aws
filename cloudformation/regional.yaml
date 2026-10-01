@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Deploy once in us-west-2 and once in us-east-1; both execute and sweep independently.
+Description: Regional request API; deploy demand-driven background workers separately using workers.yaml in each Region.
 Parameters:
   TableName: { Type: String, Default: tanstack-workflow-aws }
   CodeBucket: { Type: String, Description: S3 bucket containing the bundled Lambda ZIP in this Region }
@@ -46,36 +46,6 @@ Resources:
         S3ObjectVersion: !If [HasCodeObjectVersion, !Ref CodeObjectVersion, !Ref AWS::NoValue]
       Environment:
         Variables: { TABLE_NAME: !Ref TableName }
-  SweepWorker:
-    Type: AWS::Lambda::Function
-    Properties:
-      Runtime: nodejs22.x
-      Handler: handler.handler
-      Role: !GetAtt LambdaRole.Arn
-      Timeout: 60
-      MemorySize: 512
-      Code:
-        S3Bucket: !Ref CodeBucket
-        S3Key: !Ref CodeKey
-        S3ObjectVersion: !If [HasCodeObjectVersion, !Ref CodeObjectVersion, !Ref AWS::NoValue]
-      Environment:
-        Variables: { TABLE_NAME: !Ref TableName }
-  SweepRule:
-    Type: AWS::Events::Rule
-    Properties:
-      ScheduleExpression: rate(1 minute)
-      State: ENABLED
-      Targets:
-        - Id: local-sweeper
-          Arn: !GetAtt SweepWorker.Arn
-          Input: '{"kind":"sweep"}'
-  SweepPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref SweepWorker
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt SweepRule.Arn
   Api:
     Type: AWS::ApiGatewayV2::Api
     Properties: { Name: !Sub 'workflow-${AWS::Region}', ProtocolType: HTTP }

@@ -85,7 +85,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('DynamoDB API integration', () =
 
   it('validates the authoritative schedule after a stale GSI result', async () => {
     const { store, client, tableName } = await fixture()
-    await store.upsertSchedule({ scheduleId: 'disabled', workflowId: 'w', schedule: { kind: 'interval', everyMs: 1000 }, overlapPolicy: 'allow', enabled: true, now: 0, nextFireAt: undefined })
+    await store.upsertSchedule({ scheduleId: 'disabled', workflowId: 'w', schedule: { kind: 'interval', everyMs: 1000 }, overlapPolicy: 'allow', enabled: false, now: 0, nextFireAt: undefined })
     const send = client.send.bind(client)
     vi.spyOn(client, 'send').mockImplementation((async (command: any) => {
       if (command.constructor.name === 'QueryCommand') return { Items: [{ PK: 'SCHEDULE#disabled', SK: 'META' }] }

@@ -20,6 +20,8 @@ import type {
   WorkflowRuntimeStartRunArgs,
   WorkflowRuntimeSweepArgs,
   WorkflowRuntimeSweepResult,
+  WorkflowWorkTarget,
+  WorkflowRuntimeProcessTargetArgs,
 } from './types.js'
 
 const DEFAULT_LEASE_MS = 30_000
@@ -46,8 +48,16 @@ export function createRuntimeDriver<
     deliverApproval(args: WorkflowRuntimeDeliverApprovalArgs) {
       return deliverApproval(config, telemetry, args)
     },
+    async processTarget(args: WorkflowRuntimeProcessTargetArgs) {
+      const method = args.target.kind === 'run' ? config.store.claimStaleRun
+        : args.target.kind === 'timer' ? config.store.claimTimer
+        : args.target.kind === 'schedule' ? config.store.claimScheduleBucket : undefined
+      if (!method) throw new Error('Store does not support this targeted work claim')
+      const { remainingMayExist: _, ...result } = await processWork(config, telemetry, args, args.target)
+      return result
+    },
     sweep(args: WorkflowRuntimeSweepArgs = {}) {
-      return sweep(config, telemetry, args)
+      return processWork(config, telemetry, args)
     },
   }
 }
@@ -383,13 +393,14 @@ async function deliverApproval<
   )
 }
 
-async function sweep<TWorkflows extends Record<string, WorkflowRegistration>>(
+async function processWork<TWorkflows extends Record<string, WorkflowRegistration>>(
   config: WorkflowRuntimeConfig<TWorkflows>,
   telemetry: WorkflowTelemetry,
   args: WorkflowRuntimeSweepArgs,
+  target?: WorkflowWorkTarget,
 ): Promise<WorkflowRuntimeSweepResult> {
   return await telemetry.startActiveSpan(
-    'sweep',
+    target ? 'process_target' : 'sweep',
     { leaseOwner: args.leaseOwner },
     async (span) => {
       const startedAt = Date.now()
@@ -398,22 +409,22 @@ async function sweep<TWorkflows extends Record<string, WorkflowRegistration>>(
       const minYieldRemainingMs = normalizeMinYieldRemainingMs(
         args.minYieldRemainingMs,
       )
-      const maxScheduledRuns = normalizeSweepLimit(
+      const maxScheduledRuns = target ? (target.kind === 'schedule' ? 1 : 0) : normalizeSweepLimit(
         args.maxScheduledRuns ?? args.limit,
         DEFAULT_SWEEP_LIMIT,
         'maxScheduledRuns',
       )
-      const maxTimers = normalizeSweepLimit(
+      const maxTimers = target ? (target.kind === 'timer' ? 1 : 0) : normalizeSweepLimit(
         args.maxTimers ?? args.limit,
         DEFAULT_SWEEP_LIMIT,
         'maxTimers',
       )
-      const maxRecoveredRuns = normalizeSweepLimit(
+      const maxRecoveredRuns = target ? (target.kind === 'run' ? 1 : 0) : normalizeSweepLimit(
         args.maxRecoveredRuns ?? args.limit,
         DEFAULT_SWEEP_LIMIT,
         'maxRecoveredRuns',
       )
-      const leaseOwner = args.leaseOwner ?? createLeaseOwner(`sweep:${now}`)
+      const leaseOwner = args.leaseOwner ?? createLeaseOwner(`${target ? 'target' : 'sweep'}:${now}`)
       span.setAttribute('tanstack.workflow.lease_owner', leaseOwner)
       const leaseMs = resolveLeaseMs(config, args.leaseMs)
       const recovered: Array<WorkflowRuntimeRunResult> = []
@@ -429,10 +440,13 @@ async function sweep<TWorkflows extends Record<string, WorkflowRegistration>>(
 
         const claims = await traceStoreOperation(
           telemetry,
-          'store.claim_stale_runs',
+          target ? 'store.claim_stale_run' : 'store.claim_stale_runs',
           { leaseOwner },
-          () =>
-            config.store.claimStaleRuns({
+          async () => target?.kind === 'run'
+            ? [await config.store.claimStaleRun!({
+                ...target, now, leaseOwner, leaseMs,
+              })]
+            : config.store.claimStaleRuns({
               now,
               limit: 1,
               leaseOwner,
@@ -487,10 +501,13 @@ async function sweep<TWorkflows extends Record<string, WorkflowRegistration>>(
 
         const buckets = await traceStoreOperation(
           telemetry,
-          'store.claim_due_schedule_buckets',
+          target ? 'store.claim_schedule_bucket' : 'store.claim_due_schedule_buckets',
           { leaseOwner },
-          () =>
-            config.store.claimDueScheduleBuckets({
+          async () => target?.kind === 'schedule'
+            ? [await config.store.claimScheduleBucket!({
+                ...target, now, leaseOwner, leaseMs,
+              })]
+            : config.store.claimDueScheduleBuckets({
               now,
               limit: 1,
               leaseOwner,
@@ -549,10 +566,13 @@ async function sweep<TWorkflows extends Record<string, WorkflowRegistration>>(
 
         const dueTimers = await traceStoreOperation(
           telemetry,
-          'store.claim_due_timers',
+          target ? 'store.claim_timer' : 'store.claim_due_timers',
           { leaseOwner },
-          () =>
-            config.store.claimDueTimers({
+          async () => target?.kind === 'timer'
+            ? [await config.store.claimTimer!({
+                ...target, now, leaseOwner, leaseMs,
+              })]
+            : config.store.claimDueTimers({
               now,
               limit: 1,
               leaseOwner,

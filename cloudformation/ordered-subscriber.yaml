@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ordered application subscriber; deploy per Region with the same logical SubscriberId and MRSC table.
+Parameters:
+  TableName: { Type: String, AllowedPattern: '[a-zA-Z0-9_.-]{3,255}' }
+  SubscriberId: { Type: String, MinLength: 1, MaxLength: 256 }
+  TopicArn: { Type: String, Description: Region-local FIFO ApplicationTopicArn from workers stack }
+  CodeBucket: { Type: String }
+  CodeKey: { Type: String, Description: Immutable ZIP key containing ordered-subscriber.js }
+Resources:
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Join ['', ['subscriber-dlq-', !Select [2, !Split ['/', !Ref 'AWS::StackId']], '.fifo']]
+      FifoQueue: true
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Join ['', ['subscriber-', !Select [2, !Split ['/', !Ref 'AWS::StackId']], '.fifo']]
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy: { deadLetterTargetArn: !GetAtt DLQ.Arn, maxReceiveCount: 8 }
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref Queue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt Queue.Arn
+            Condition:
+              ArnEquals: { 'aws:SourceArn': !Ref TopicArn }
+  Subscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: QueuePolicy
+    Properties:
+      TopicArn: !Ref TopicArn
+      Protocol: sqs
+      Endpoint: !GetAtt Queue.Arn
+      RawMessageDelivery: true
+      FilterPolicy: { ordered: ['true'] }
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties: { RetentionInDays: 30 }
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrderedSubscriber
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt Queue.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogGroup.Arn
+  Worker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: ordered-subscriber.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code: { S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey }
+      LoggingConfig: { LogGroup: !Ref LogGroup }
+      Environment:
+        Variables: { TABLE_NAME: !Ref TableName, SUBSCRIBER_ID: !Ref SubscriberId }
+  Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !Ref Worker
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  BlockedMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: '"ordered_delivery_blocked"'
+      MetricTransformations:
+        - MetricNamespace: WorkflowEvents
+          MetricName: !Sub '${AWS::StackName}-OrderedBlocked'
+          MetricValue: '1'
+          DefaultValue: 0
+  BlockedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: WorkflowEvents
+      MetricName: !Sub '${AWS::StackName}-OrderedBlocked'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{ Name: QueueName, Value: !GetAtt Queue.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt DLQ.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+Outputs:
+  QueueUrl: { Value: !Ref Queue }
+  DLQUrl: { Value: !Ref DLQ }
+  SubscriberFunction: { Value: !Ref Worker }

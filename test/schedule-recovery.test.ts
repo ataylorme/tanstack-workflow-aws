@@ -19,9 +19,9 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('DynamoDB schedule crash recover
     await store.upsertSchedule(schedule(200))
     expect(await store.claimDueScheduleBuckets(claim(120, 'east'))).toEqual([])
     const [recovered] = await store.claimDueScheduleBuckets(claim(200, 'east'))
-    expect(recovered).toMatchObject({ bucketId: '100', runId: old!.runId, input: { fireAt: 100 } })
-    await store.withLeaseOwner('east', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '100', runId: recovered!.runId, now: 200 }))
-    expect((await store.claimDueScheduleBuckets(claim(200, 'east')))[0]).toMatchObject({ bucketId: '200', input: { fireAt: 200 } })
+    expect(recovered).toMatchObject({ bucketId: '1:100', runId: old!.runId, input: { fireAt: 100 } })
+    await store.withLeaseOwner('east', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '1:100', runId: recovered!.runId, now: 200 }))
+    expect((await store.claimDueScheduleBuckets(claim(200, 'east')))[0]).toMatchObject({ bucketId: '2:200', input: { fireAt: 200 } })
   })
 
   it('does not reclaim a live bucket in the same owner context and rejects stale owners', async () => {
@@ -31,10 +31,10 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('DynamoDB schedule crash recover
     expect(await store.claimDueScheduleBuckets(claim(110))).toEqual([])
     expect(await store.claimDueScheduleBuckets(claim(110, 'east'))).toEqual([])
     await store.claimDueScheduleBuckets(claim(131, 'east'))
-    await expect(store.withLeaseOwner('west', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '100', runId: first!.runId, now: 131 }))).rejects.toThrow('Lost schedule bucket lease')
-    await expect(store.withLeaseOwner('east', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '100', runId: 'wrong', now: 131 }))).rejects.toThrow('mismatched bucket')
-    await store.withLeaseOwner('east', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '100', runId: first!.runId, now: 131 }))
-    expect(await store.claimDueScheduleBuckets(claim(200))).toEqual([])
+    await expect(store.withLeaseOwner('west', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '1:100', runId: first!.runId, now: 131 }))).rejects.toThrow('Lost schedule bucket lease')
+    await expect(store.withLeaseOwner('east', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '1:100', runId: 'wrong', now: 131 }))).rejects.toThrow('mismatched bucket')
+    await store.withLeaseOwner('east', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '1:100', runId: first!.runId, now: 131 }))
+    expect((await store.claimDueScheduleBuckets(claim(200)))[0]).toMatchObject({ bucketId: '1:200' })
   })
 
   it.each(['skip', 'allow'] as const)('enforces %s for an existing paused scheduled run', async policy => {
@@ -42,7 +42,7 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('DynamoDB schedule crash recover
     await store.upsertSchedule(schedule(100, policy))
     const [first] = await store.claimDueScheduleBuckets(claim(100))
     await store.saveRunState({ state: { runId: first!.runId, workflowId: 'task', status: 'paused', input: {}, waitingFor: { signalName: 'external' }, createdAt: 100, updatedAt: 100 } })
-    await store.withLeaseOwner('west', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '100', runId: first!.runId, now: 101 }))
+    await store.withLeaseOwner('west', () => store.markScheduleBucketStarted({ scheduleId: 'periodic', bucketId: '1:100', runId: first!.runId, now: 101 }))
     await store.upsertSchedule(schedule(200, policy))
     const second = await store.claimDueScheduleBuckets(claim(200, 'east'))
     expect(second).toHaveLength(policy === 'skip' ? 0 : 1)
@@ -50,25 +50,23 @@ describe.skipIf(!process.env.DYNAMODB_ENDPOINT)('DynamoDB schedule crash recover
       await store.saveRunState({ state: { runId: first!.runId, workflowId: 'task', status: 'finished', input: {}, createdAt: 100, updatedAt: 210 } })
       expect(await store.claimDueScheduleBuckets(claim(220))).toEqual([])
       await store.upsertSchedule(schedule(300, policy))
-      expect((await store.claimDueScheduleBuckets(claim(300)))[0]?.bucketId).toBe('300')
+      expect((await store.claimDueScheduleBuckets(claim(300)))[0]?.bucketId).toBe('3:300')
     }
   })
 
-  it('ignores stale definitions and prevents a newer writer rolling the due tick backward', async () => {
+  it('ignores stale definitions and applies newer definitions with a fresh generation', async () => {
     const { store } = await fixture()
     await store.upsertSchedule(schedule(200))
     await store.upsertSchedule({ ...schedule(100), enabled: false })
     await store.upsertSchedule({ ...schedule(100), now: 300 })
-    expect((await store.claimDueScheduleBuckets(claim(300)))[0]).toMatchObject({ bucketId: '200', input: { fireAt: 200 } })
+    expect((await store.claimDueScheduleBuckets(claim(300)))[0]).toMatchObject({ bucketId: '2:100', input: { fireAt: 100 } })
   })
 
-  it('rejects workflow and overlap policy changes but permits input updates', async () => {
+  it('uses a new generation when workflow, overlap policy, or inputs change', async () => {
     const { store } = await fixture()
     await store.upsertSchedule(schedule(100, 'allow'))
-    await expect(store.upsertSchedule(schedule(200, 'skip'))).rejects.toThrow('immutable')
-    await expect(store.upsertSchedule({ ...schedule(200), workflowId: 'different' })).rejects.toThrow('immutable')
-    await store.upsertSchedule(schedule(200, 'allow'))
-    expect((await store.claimDueScheduleBuckets(claim(200)))[0]).toMatchObject({ workflowId: 'task', input: { fireAt: 200 } })
+    await store.upsertSchedule({ ...schedule(200, 'skip'), workflowId: 'different' })
+    expect((await store.claimDueScheduleBuckets(claim(200)))[0]).toMatchObject({ workflowId: 'different', bucketId: '2:200', input: { fireAt: 200 } })
   })
 
   it.each(['buffer-one', 'cancel-previous', 'terminate-previous'] as const)('rejects unsupported %s explicitly', async policy => {
